@@ -547,7 +547,7 @@ export class ScheduleGenerator
 spec ->
   import 'spec_macros' as $
 
-  import 'ox.nodes.marshal.util.clock' as :TestClock
+  import 'ox.clock' as :TestClock
   import 'spec' as :describe, :it, :matchers
 
   import deep_eq, eq, ge, gt, has_fields, le, len, lt, matches, not_ from matchers

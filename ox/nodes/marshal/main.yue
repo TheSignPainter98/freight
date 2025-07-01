@@ -3,10 +3,10 @@ local *
 -- TODO(kcza): Check station-name uniqueness
 
 import 'compat' as :HOST
+import 'ox.clock' as :MinecraftClock
 import 'ox.cmd.declare' as :DeclareTrainStateResponse
 import 'ox.configurator.listener' as :ConfigListener
-import 'ox.configurator.main' as :MarshalIdentityRequest, :MarshalIdentityResponse
-import 'ox.configurator.main' as :GetConfigResponse, :SetConfigResponse
+import 'ox.configurator.main' as :GetConfigResponse, :MarshalIdentityRequest, :MarshalIdentityResponse, :SetConfigResponse
 import 'ox.data.queue' as :Queue
 import 'ox.firewall' as :Firewall
 import 'ox.logger' as :log, :trace
@@ -14,7 +14,6 @@ import 'ox.nodes.factory.main' as :FactoryHeartbeat
 import 'ox.nodes.marshal.resource_orchestrator.main' as :ResourceOrchestrator
 import 'ox.nodes.marshal.resource_orchestrator.promise_tracker' as :PromiseTracker
 import 'ox.nodes.marshal.resource_orchestrator.scheduler' as :Scheduler
-import 'ox.nodes.marshal.util.clock' as :MinecraftClock
 import 'ox.nodes.marshal.util.pseudo_random' as :PseudoRandom
 import 'ox.pc' as :Pc
 import 'ox.peripheral.uplink' as :IdempotenceToken, :Packet, :TestUplinkBackend, :TIMEOUT, :Uplink
@@ -689,9 +688,9 @@ class RoundRobin
 spec ->
   import 'spec_macros' as $
 
+  import 'ox.clock' as :TestClock
   import 'ox.cmd.declare' as :DeclareTrainState
   import 'ox.configurator.main' as :GetConfigRequest, :SetConfigRequest
-  import 'ox.nodes.marshal.util.clock' as :TestClock
   import 'ox.pc' as :TestPcBackend
   import 'spec' as :describe, :it, :matchers
 

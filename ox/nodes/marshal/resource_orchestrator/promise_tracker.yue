@@ -1,7 +1,7 @@
 local *
 
+import 'ox.clock' as :MinecraftClock
 import 'ox.logger' as :log, :trace
-import 'ox.nodes.marshal.util.clock' as :MinecraftClock
 import 'quicktype' as :declare_type, :F, :T
 import 'spec' as :spec
 
@@ -249,7 +249,7 @@ spec ->
   import 'spec_macros' as $
 
   import 'compat' as :HOST
-  import 'ox.nodes.marshal.util.clock' as :TestClock
+  import 'ox.clock' as :TestClock
   import 'ox.nodes.marshal.util.pseudo_random' as :PseudoRandom
   import 'spec' as :describe, :it, :matchers
 
