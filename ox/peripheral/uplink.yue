@@ -98,12 +98,8 @@ export class Packet
   @protocol: F '() => string', =>
     @.__class.__name
 
-  @from: F '(Packet) => <?Packet, boolean>', (raw) =>
-    if raw.protocol == @@protocol!
-      raw.<> = __index: @
-      raw, true
-    else
-      nil, false
+  @matches: F '(Packet) => boolean', (raw) =>
+    raw.protocol == @@protocol!
 
 declare_type 'TestUplinkBackendOpts', [[{
   to_receive: ?[NetworkFrameSpec] | () -> [NetworkFrameSpec],
@@ -311,18 +307,14 @@ spec ->
           * { 3, TestPacket 'packet-3' }
 
   describe 'Packet', ->
-    it 'survives roundtrip', ->
-      original = TestPacket 'hello'
+    describe '::matches', ->
+      it 'accepts correct packets', ->
+        ok = TestPacket::matches TestPacket 'hello'
+        $expect_that ok, eq true
 
-      correct_decode, ok = TestPacket::from original
-      $expect_that correct_decode, deep_eq
-        protocol: 'TestPacket'
-        data: 'hello'
-      $expect_that ok, eq true
-
-      incorrect_decode, ok = TestPacket2::from {protocol: TestPacket::protocol!}
-      $expect_that incorrect_decode, eq nil
-      $expect_that ok, eq false
+      it 'rejects incorrect packets', ->
+        ok = TestPacket2::matches {protocol: TestPacket::protocol!}
+        $expect_that ok, eq false
 
   describe 'IdempotenceToken', ->
     it 'is safe to cross lua machine boundaries', ->
