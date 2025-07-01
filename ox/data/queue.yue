@@ -5,9 +5,10 @@ import 'spec' as :spec
 
 declare_type 'Queue', [[{
   len: () => number,
-  enqueue: (any) => <>,
-  dequeue: () => ?any,
-  peek: () => ?any,
+  enqueue: (some) => <>,
+  dequeue: () => ?some,
+  extract: ((some) -> boolean) => ?some,
+  peek: () => ?some,
   iter: () => function,
 }]]
 export class Queue
@@ -15,13 +16,15 @@ export class Queue
     @elems = {}
     @front = 1
     @back = 1
+    @_len = 0
 
   len: F '() => number', =>
-    @back - @front
+    @_len
 
-  enqueue: F '(any) => <>', (elem) =>
+  enqueue: F '(some) => <>', (elem) =>
     @elems[@back] = T @elem_type, elem
     @back += 1
+    @_len += 1
 
   dequeue: F '() => ?some', =>
     ret = @elems[@front]
@@ -29,10 +32,26 @@ export class Queue
       T @elem_type, ret
       @elems[@front] = nil
       @front += 1
+      @_len -= 1
     ret
 
-  peek: F '() => ?any', =>
+  peek: F '() => ?some', =>
     @elems[@front]
+
+  extract: F '((some) -> boolean) => ?some', (filter) =>
+    for i = @front, @back
+      elem = @elems[i]
+      if not elem?
+        continue
+      if filter elem
+        @elems[i] = nil
+        if i == @front
+          while not @elems[@front]?
+            @front += 1
+        @_len -= 1
+
+        return elem
+    nil
 
   iter: =>
     coroutine.wrap ->
@@ -86,6 +105,22 @@ spec ->
         elem.interloper = 'interloper'
 
         $expect_that (-> \dequeue!), errors matches 'expected nil but got string'
+
+    describe '\\extract', ->
+      it 'extracts and handles length', ->
+        queue = with Queue 'some'
+          for i = 1, 3
+            \enqueue i
+
+          extracted = \extract (elem) -> elem == 2
+          $expect_that extracted, eq 2
+          $expect_that \len!, eq 2
+
+          extracted = \extract (elem) -> elem == 2
+          $expect_that extracted, eq nil
+          $expect_that \len!, eq 2
+
+      it 'does not change on missing items', ->
 
     describe '\\iter', ->
       it 'yields in the correct order', ->
