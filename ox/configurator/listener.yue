@@ -3,23 +3,28 @@ local *
 import 'ox.configurator.main' as :GetConfigRequest, :GetConfigResponse, :SetConfigRequest, :SetConfigResponse
 import 'ox.data.queue' as :Queue
 import 'ox.firewall' as :Firewall
-import 'ox.state' as :State, :StateMachineBuilder, :StateResponsesBuilder
-import 'quicktype' as :declare_type, :F
+import 'ox.state' as :shallow_log_reporter, :State, :StateMachineBuilder, :StateResponsesBuilder
+import 'quicktype' as :declare_type, :F, :is
+
+import 'ox.toml'
 
 declare_type 'ConfigListener', 'Component'
 declare_type 'ConfigListenerEvent', [[{
   type: "network-packet",
 }]]
 declare_type 'ConfigListenerOpts', [[{
-  target: Component,
+  config_type: string,
+  target: Component + { config: some },
   uplink: Uplink,
 }]]
 export class ConfigListener
   new: F '(ConfigListenerOpts) => <>', (opts) =>
     {
+      :config_type
       :target
       :uplink
     } = opts
+    @config_type = config_type
     @target = target
     @uplink = uplink
 
@@ -34,25 +39,47 @@ export class ConfigListener
   @make_sm: F '() => StateMachine', =>
     (StateMachineBuilder 'config_listener')
       \set_initial_state 'waiting'
+      \set_reporter shallow_log_reporter
       \add (State 'waiting')
         \declare_end_state!
         \add_transition_to 'inspecting_packet'
       \add (State 'inspecting_packet')
-        \add_transition_to 'waiting'
+        \set_data_type [[{
+          packet: Packet,
+        }]]
         \add_transition_to 'analysing_get_config_request'
         \add_transition_to 'analysing_set_config_request'
       \add (State 'analysing_get_config_request')
+        \set_data_type [[{
+          packet: GetConfigRequest,
+        }]]
         \add_transition_to 'sending_get_config_response'
       \add (State 'sending_get_config_response')
+        \set_data_type [[{
+          idemp_tok: IdempotenceToken,
+          recipient_id: number,
+          raw: string,
+        }]]
         \add_transition_to 'waiting'
       \add (State 'analysing_set_config_request')
-        \add_transition_to 'testing_config'
-      \add (State 'testing_config')
+        \set_data_type [[{
+          packet: SetConfigRequest,
+        }]]
         \add_transition_to 'sending_set_config_response'
       \add (State 'sending_set_config_response')
+        \set_data_type [[{
+          idemp_tok: IdempotenceToken,
+          recipient_id: number,
+          response: { config: {} }
+            | { error_reason: string },
+          error: ?string,
+        }]]
         \add_transition_to 'scheduling_config_application'
         \add_transition_to 'waiting'
       \add (State 'scheduling_config_application')
+        \set_data_type [[{
+          config: {},
+        }]]
         \add_transition_to 'waiting'
       \build!
 
@@ -63,7 +90,6 @@ export class ConfigListener
       \add 'analysing_get_config_request', @\on_analysing_get_config_request
       \add 'sending_get_config_response', @\on_sending_get_config_response
       \add 'analysing_set_config_request', @\on_analysing_set_config_request
-      \add 'testing_config', @\on_testing_config
       \add 'sending_set_config_response', @\on_sending_set_config_response
       \add 'scheduling_config_application', @\on_scheduling_config_application
       \build!
@@ -72,25 +98,99 @@ export class ConfigListener
     @sm_responses[@sm.state.name]!
 
   on_waiting: F '() => <>', =>
-    error 'TODO'
+    event = @events\dequeue!
+    if not event?
+      return
+    switch event.type
+      when 'network-packet'
+        @sm\goto 'inspecting_packet',
+          packet: event.packet
+      else
+        error "internal error: unrecognised event type '#{event.type}'"
 
   on_inspecting_packet: F '() => <>', =>
-    error 'TODO'
+    { :packet } = @sm.state
+    switch packet.protocol
+      when 'GetConfigRequest'
+        @sm\goto 'analysing_get_config_request',
+          :packet
+      when 'SetConfigRequest'
+        @sm\goto 'analysing_set_config_request',
+          :packet
+      else
+        import 'spec' as :repr
+        error "internal error: unhandled packet admitted through firewall: #{repr protocol}"
 
   on_analysing_get_config_request: F '() => <>', =>
-    error 'TODO'
+    {
+      packet:
+        :idemp_tok
+        :pc_id
+    } = @sm.state
+    @sm\goto 'sending_get_config_response',
+      :idemp_tok
+      recipient_id: pc_id
+      raw: @target.config.<raw>
 
   on_sending_get_config_response: F '() => <>', =>
-    error 'TODO'
+    { :idemp_tok, :recipient_id, :raw } = @sm.state
+    @uplink\send_to recipient_id, GetConfigResponse idemp_tok, raw
+    @sm\goto 'waiting'
 
   on_analysing_set_config_request: F '() => <>', =>
-    error 'TODO'
+    {
+      packet:
+        :idemp_tok
+        :pc_id
+        :raw
+    } = @sm.state
+    config, error_reason = toml.decode raw
+    if err?
+      @sm\goto 'sending_set_config_response',
+        :idemp_tok
+        recipient_id: pc_id
+        response:
+          :error_reason
+      return
 
-  on_testing_config: F '() => <>', =>
-    error 'TODO'
+    ok, error_reason = is @config_type, config
+    if not ok
+      @sm\goto 'sending_set_config_response',
+        :idemp_tok
+        recipient_id: pc_id
+        response:
+          :error_reason
+      return
+
+    config.<> = {}
+    config.<raw> = raw
+    @sm\goto 'sending_set_config_response',
+      :idemp_tok
+      recipient_id: pc_id
+      response:
+        :config
 
   on_sending_set_config_response: F '() => <>', =>
-    error 'TODO'
+    {
+      :idemp_tok
+      :recipient_id
+      response:
+        :config
+        :error_reason
+    } = @sm.state
+    if config?
+      @uplink\send_to recipient_id, SetConfigResponse idemp_tok, nil
+      @sm\goto 'scheduling_config_application',
+        :config
+    else if error_reason?
+      @uplink\send_to recipient_id, SetConfigResponse idemp_tok, error_reason
+      @sm\goto 'waiting'
+    else
+      error 'unreachable'
 
   on_scheduling_config_application: F '() => <>', =>
-    error 'TODO'
+    { :config } = @sm.state
+    @target.events\enqueue
+      type: 'new-config'
+      :config
+    @sm\goto 'waiting'

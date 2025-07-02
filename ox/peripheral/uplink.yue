@@ -60,11 +60,11 @@ export class Uplink
       return id, packet
 
     packet.protocol = protocol
-    data, ok = packet_type::from packet
-    if not ok
+    if not packet_type::matches packet
       import 'spec' as :repr
       error "unexpected packet #{repr packet}, expected #{packet_type::protocol!} but got #{packet.protocol}"
-    id, data
+    id, packet
+
 declare_type 'UplinkReceiveOpts', [[{
   timeout: ?number,
 }]]
@@ -137,19 +137,18 @@ export class TestUplinkBackend
     if on_broadcast?
       @on_broadcast = F '(any, ?string) => boolean', on_broadcast
 
-    @num_receives = 0
-
     @original_to_receive = to_receive
     @reset!
 
   reset: F '() => <>', =>
+    @num_received = T 'number', 0
     @to_receive = T '[NetworkFrameSpec]',
       switch type @original_to_receive
         when 'table'
           [ frame for frame in *@original_to_receive ]
         when 'function'
           @original_to_receive!
-    @num_to_receive = #@to_receive
+    @num_to_receive = T 'number', #@to_receive
     @sent = T '[NetworkFrame]', {}
     @broadcasted = T '[NetworkFrameData]', {}
 
@@ -181,20 +180,24 @@ export class TestUplinkBackend
 
       if not protocol_filter? or protocol_filter == protocol
         @to_receive[i] = nil
-        @num_receives += 1
+        @num_received += 1
         return from_id, packet, protocol
 
     trace "! no more #{protocol_filter? and protocol_filter .. ' ' or ''}packets to receive"
     @on_absent_frame protocol_filter, timeout
 
-  on_absent_frame: F '(?string, ?number) => <nil, TIMEOUT, nil>', (protocol_filter, timeout) =>
+  on_absent_frame: F '(?string, ?number) => <?number, any|TIMEOUT, ?string>', (protocol_filter, timeout) =>
     if timeout?
       return nil, TIMEOUT, nil
 
     if not coroutine.running!?
       error "internal test error: network-read of #{protocol_filter} would cause jam (no timeout, not in coroutine)"
-    while true
+
+    -- Yield forever until reset
+    while @num_received == @num_to_receive
       coroutine.yield!
+
+    @receive protocol_filter, timeout
 
 declare_type 'IdempotenceToken', 'number'
 IDEMP_TOK_MAX = bit.lshift 1, 30

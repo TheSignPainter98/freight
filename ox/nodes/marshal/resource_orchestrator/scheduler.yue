@@ -1,14 +1,21 @@
 local *
+local ScheduleGenerator
 
+import 'ox.data.queue' as :Queue
 import 'ox.firewall' as :Firewall
 import 'ox.logger' as :log, :trace
 import 'ox.nodes.marshal.resource_orchestrator.promise_tracker' as :PromiseTracker
 import 'ox.nodes.marshal.util.pseudo_random' as :PseudoRandom
 import 'ox.peripheral.station' as :time_units
-import 'ox.state' as :State, :StateMachineBuilder, :StateResponsesBuilder
+import 'ox.state' as :shallow_log_reporter, :State, :StateMachineBuilder, :StateResponsesBuilder
 import 'quicktype' as :declare_type, :F, :T
 import 'spec' as :spec
 
+declare_type 'Scheduler', [[{
+  events: Queue,
+  schedule_generator: (string, Factory, [Factory]) => ScheduleGenerator,
+  train_is_lost: (string) => boolean,
+}]]
 declare_type 'ScheduleCandidate', [[{
   train_addr: TrainAddress,
   inbound_station_addr: StationAddress,
@@ -23,11 +30,21 @@ declare_type 'TrainAddress', [[
   { name: string }
   + StationAddress
 ]]
+declare_type 'SchedulerEvent', [[{
+  type: "network-packet",
+  packet: Packet,
+} | {
+  type: "start-scheduling",
+  schedule_generator: ScheduleGenerator,
+} | {
+  type: "declare-train-state",
+  train_name: string,
+  state: TrainState,
+}]]
 declare_type 'SchedulerOpts', [[{
   resend_cooldown_seconds: ?number,
   clock: Clock,
   rand: Random,
-  promise_tracker: PromiseTracker,
 }]]
 export class Scheduler
   new: F '(SchedulerOpts) => <>', (opts) =>
@@ -35,316 +52,406 @@ export class Scheduler
       :resend_cooldown_seconds=@@DEFAULT_RESEND_COOLDOWN_SECONDS
       :clock,
       :rand
-      :promise_tracker
     } = opts
     @resend_cooldown_seconds = resend_cooldown_seconds
     @clock = clock
     @rand = rand
-    @promise_tracker = promise_tracker
+    @promise_tracker = PromiseTracker @rand, @clock
 
     @resend_cooldowns = T '{string->{string->number}}', {}
 
     @firewall = Firewall
-      * ScheduleResponse
+      * FactoryHeartbeat
+    @events = Queue 'SchedulerEvent'
     @sm = @@make_sm!
+    @sm_responses = @make_sm_responses @sm
 
   @make_sm: F '() => StateMachine', =>
-    @sm_builder ??= (StateMachineBuilder 'scheduler')
+    (StateMachineBuilder 'scheduler')
       \set_initial_state 'waiting'
+      \set_reporter shallow_log_reporter
       \add (State 'waiting')
         \declare_end_state!
-        \add_transition_to 'generating_schedule'
-      \add (State 'generating_schedule')
-        \add_transition_to 'proposing_schedule'
-        \add_transition_to 'out_of_schedules'
-      \add (State 'proposing_schedule')
-        \add_transition_to 'generating_schedule'
-        \add_transition_to 'schedule_applied'
-      \add (State 'schedule_applied')
+        \add_transition_to 'inspecting_packet'
+        \add_transition_to 'scheduling'
+        \add_transition_to 'enacting_train_state_declaration'
+      \add (State 'inspecting_packet')
+        \set_data_type [[{
+          packet: Packet,
+        }]]
+        \add_transition_to 'analysing_factory_heartbeat'
+      \add (State 'analysing_factory_heartbeat')
+        \set_data_type [[{
+          packet: FactoryHeartbeat,
+        }]]
         \add_transition_to 'waiting'
-      \add (State 'out_of_schedules')
+      \add (State 'scheduling')
+        \set_data_type [[{
+          active_schedule_generator: ScheduleGenerator,
+        }]]
         \add_transition_to 'waiting'
-    @sm_builder\build!
+      \add (State 'enacting_train_state_declaration')
+        \set_data_type [[{
+          train_name: string,
+          state: TrainState,
+        }]]
+        \add_transition_to 'waiting'
+      \build!
+
+  make_sm_responses: F '(StateMachine) => StateResponses', (sm) =>
+    (StateResponsesBuilder sm)
+      \add 'waiting', @\on_waiting
+      \add 'inspecting_packet', @\on_inspecting_packet
+      \add 'analysing_factory_heartbeat', @\on_analysing_factory_heartbeat
+      \add 'scheduling', @\on_scheduling
+      \add 'enacting_train_state_declaration', @\on_enacting_train_state_declaration
+      \build!
+
+  step: F '() => <>', =>
+    @sm_responses[@sm.state.name]!
 
   @DEFAULT_RESEND_COOLDOWN_SECONDS: 90
 
-  schedule_candidates: F '(string, Factory, [Factory]) => thread', (resource, factory, factories) =>
-    coroutine.create ->
-      if @is_on_cooldown factory.name, resource
-        log -> "factory #{factory.name} has an active cooldown for #{resource}"
-        return
+  on_waiting: F '() => <>', =>
+    event = @events\dequeue!
+    if not event?
+      return
+    switch event.type
+      when 'network-packet'
+        @sm\goto 'inspecting_packet',
+          packet: event.packet
+      when 'start-scheduling'
+        @sm\goto 'scheduling',
+          schedule_generator: event.schedule_generator
+      when 'declare-train-state'
+        @sm\goto 'enacting_train_state_declaration',
+          train_name: event.train_name
+          state: event.state
+      else
+        error "internal error: unrecognised event type '#{event.type}'"
 
-      inbound_station_addrs = @_inbound_station_addrs resource, factory
-      if #inbound_station_addrs == 0
-        log -> "no available station at #{factory.name} accepts inbound #{resource}"
-        return
-      free_inbound_station_addrs_by_network = @_free_station_addrs_by_network inbound_station_addrs
+  on_inspecting_packet: F '() => <>', =>
+    { :packet } = @sm.state
+    switch packet.protocol
+      when 'FactoryHeartbeat'
+        @sm\goto 'analysing_factory_heartbeat',
+          packet: event.packet
+      else
+        error "internal error: unrecognised protocol '#{event.type}'"
 
-      outbound_station_addrs = {}
-      outbound_station_addrs_by_network = {}
-      do
-        networks = with {}
-          seen_networks = {}
-          for inbound_station_addr in *inbound_station_addrs
-            network = inbound_station_addr.station.network
-            if seen_networks[network]
-              continue
-            seen_networks[network] = true
-            [] = network
-        import 'spec' as :repr
-        trace "> networks: #{repr networks}"
-
-        for network in *networks
-          addrs = @_outbound_station_addrs resource, network, factories
-          trace "< network #{network} provides #{repr [ addr.name for addr in *addrs ]}"
-          outbound_station_addrs_by_network[network] = addrs
-          for addr in *addrs
-            outbound_station_addrs[] = addr
-        if #outbound_station_addrs == 0
-          log -> "no available outbound stations which provide #{resource} on any network"
-          return
-
-      -- Yield unique local candidates
-      yielded_local_candiates = {}
-      @_yield_candidate_set yielded_local_candiates, @_inbound_local_schedule_candidates resource,
-        factory,
-        inbound_station_addrs,
-        outbound_station_addrs_by_network
-      @_yield_candidate_set yielded_local_candiates, @_outbound_local_schedule_candidates resource,
-          free_inbound_station_addrs_by_network,
-          outbound_station_addrs
-
-      -- Yield candidates from anywhere in any network
-      train_addrs = @_train_addrs factories
-      if #train_addrs == 0
-        return
-      @_yield_global_schedule_candidates resource,
-        free_inbound_station_addrs_by_network,
-        outbound_station_addrs_by_network,
-        train_addrs
-
-  _yield_candidate_set: F '([ScheduleCandidate], [ScheduleCandidate]) => <>', (yielded, candidates) =>
-    for candidate in *candidates
-      if @_already_yielded candidate, yielded
-        continue
-      @_yield_candidate candidate
-
-  _already_yielded: F '(ScheduleCandidate, [ScheduleCandidate]) => boolean', (candidate, yielded) =>
+  on_analysing_factory_heartbeat: F '() => <>', =>
     {
-      :inbound_station_addr,
-      :outbound_station_addr,
-      :train_addr,
-    } = candidate
-    for prior in *yielded
-      if prior.inbound_station_addr.station.name != inbound_station_addr.station.name
-        continue
-      if prior.outbound_station_addr.station.name != outbound_station_addr.station.name
-        continue
-      if prior.train_addr.name != train_addr.name
-        continue
-      return true
-    false
+      packet:
+        :stations
+    } = @sm.state
+    lost_trains = with {}
+      for station in *stations.known
+        for train in *station.present_trains
+          if @train_is_lost train
+            [] = train
+    for lost_train in *lost_trains
+      log -> "train '#{lost_train}' was lost. It will be ignored until manually cleared for use"
+    @sm\goto 'waiting'
 
-  _inbound_station_addrs: F '(string, Factory) => [StationAddress]', (resource, factory) =>
-    with {}
-      for station in *factory.stations.known
-        if station.type != 'inbound'
-          continue
-        if station.handles != resource
-          continue
-        if @promise_tracker\station_is_fully_promised station
-          continue
-        [] = :factory, :station
+  on_scheduling: F '() => <>', =>
+    { :schedule_generator } = @sm.state
+    -- Await completion.
+    if schedule_generator.done
+      @sm\goto 'waiting'
 
-  _outbound_station_addrs: F '(string, string, [Factory]) => [StationAddress]', (resource, network, factories) =>
-    with {}
-      trace "checking among #{#factories} factories"
-      for factory in *factories
-        trace "inspecting #{factory.name} for #{resource}"
-        if not @_factory_has_surplus_resource resource, factory
-          trace "factory #{factory.name} does NOT have a surplus of #{resource}"
-          continue
+  on_enacting_train_state_declaration: F '() => <>', =>
+    { :train_name, :state } = @sm.state
+    error_reason = switch state
+      when 'cleared' -- TODO(kcza): this name is a leak from the CLI
+        @promise_tracker\declare_train_found train_name
+      when 'reserved'
+        @promise_tracker\reserve train_name
+        nil
+      else
+        "internal error: unknown train state '#{state}'"
+    if error_reason?
+      log ->
+        "cannot enact train state '#{train_name}'='#{state}': #{error_reason}"
 
-        for station in *factory.stations.known
-          if station.handles != resource
-            trace "wrong resource (#{station.handles})"
-            continue
-          if station.type != 'outbound'
-            trace "wrong type (#{station.type})"
-            continue
-          if station.network != network
-            trace "wrong network (#{station.network})"
-            continue
-          if @promise_tracker\station_is_fully_promised station
-            trace "fully promised"
-            continue
-          trace "ok!"
-          [] = :factory, :station
+    @sm\goto 'waiting'
 
-  _factory_has_surplus_resource: F '(string, Factory) => boolean', (resource, factory) =>
-    for detected_resource in *factory.stockpile.known
-      if detected_resource.name != resource
-        continue
-      if not detected_resource.surplus_amount?
-        continue
-      if detected_resource.stored < detected_resource.surplus_amount
-        continue
-      return true
-    false
+  schedule_generator: F '(string, Factory, [Factory]) => ScheduleGenerator', (resource, factory, factories) =>
+    schedule_generator = ScheduleGenerator
+      :factories
+      :factory
+      :resource
+      parent_sm: @sm
+      promise_tracker: @promise_tracker
+      rand: @rand
+    @events\enqueue
+      type: 'start-scheduling'
+      :schedule_generator
+    schedule_generator
 
-  _inbound_local_schedule_candidates: F '(string, Factory, [StationAddress], {string->[StationAddress]}) => [ScheduleCandidate]', (resource, factory, inbound_station_addrs, outbound_station_addrs_by_network) =>
-    ret = with {}
-      for inbound_station_addr in *inbound_station_addrs
-        station = inbound_station_addr.station
-        for train_name in *station.present_trains
-          if @promise_tracker\train_is_promised train_name
-            continue
+  train_is_lost: F '(string) => boolean', (train_name) =>
+    @promise_tracker\train_is_lost train_name
 
-          outbound_station_addr = @rand\pick outbound_station_addrs_by_network[station.network]
-          if not outbound_station_addr?
-            continue
+  -- schedule_candidates: F '(string, Factory, [Factory]) => thread', (resource, factory, factories) =>
+  --   coroutine.create ->
+  --     -- if @is_on_cooldown factory.name, resource
+  --     --   log -> "factory #{factory.name} has an active cooldown for #{resource}"
+  --     --   return
+  --
+  --     -- inbound_station_addrs = @_inbound_station_addrs resource, factory
+  --     -- if #inbound_station_addrs == 0
+  --     --   log -> "no available station at #{factory.name} accepts inbound #{resource}"
+  --     --   return
+  --     -- free_inbound_station_addrs_by_network = @_free_station_addrs_by_network inbound_station_addrs
+  --
+  --     -- outbound_station_addrs = {}
+  --     -- outbound_station_addrs_by_network = {}
+  --     -- do
+  --     --   networks = with {}
+  --     --     seen_networks = {}
+  --     --     for inbound_station_addr in *inbound_station_addrs
+  --     --       network = inbound_station_addr.station.network
+  --     --       if seen_networks[network]
+  --     --         continue
+  --     --       seen_networks[network] = true
+  --     --       [] = network
+  --     --   import 'spec' as :repr
+  --     --   trace "> networks: #{repr networks}"
+  --     --
+  --     --   for network in *networks
+  --     --     addrs = @_outbound_station_addrs resource, network, factories
+  --     --     trace "< network #{network} provides #{repr [ addr.name for addr in *addrs ]}"
+  --     --     outbound_station_addrs_by_network[network] = addrs
+  --     --     for addr in *addrs
+  --     --       outbound_station_addrs[] = addr
+  --     --   if #outbound_station_addrs == 0
+  --     --     log -> "no available outbound stations which provide #{resource} on any network"
+  --     --     return
+  --
+  --     -- Yield unique local candidates
+  --     yielded_local_candiates = {}
+  --     @_yield_candidate_set yielded_local_candiates, @_inbound_local_schedule_candidates resource,
+  --       factory,
+  --       inbound_station_addrs,
+  --       outbound_station_addrs_by_network
+  --     @_yield_candidate_set yielded_local_candiates, @_outbound_local_schedule_candidates resource,
+  --         free_inbound_station_addrs_by_network,
+  --         outbound_station_addrs
+  --
+  --     -- Yield candidates from anywhere in any network
+  --     train_addrs = @_train_addrs factories
+  --     if #train_addrs == 0
+  --       return
+  --     @_yield_global_schedule_candidates resource,
+  --       free_inbound_station_addrs_by_network,
+  --       outbound_station_addrs_by_network,
+  --       train_addrs
 
-          [] =
-            train_addr:
-              name: train_name
-              :station
-              :factory
-            :inbound_station_addr
-            :outbound_station_addr
-            schedule: @_train_schedule
-              inbound_addr: inbound_station_addr
-              outbound_addr: outbound_station_addr
-            info:
-              inbound_factory_name: inbound_station_addr.factory.name
-              :resource
-    @rand\shuffle ret
-    ret
+  -- _yield_candidate_set: F '([ScheduleCandidate], [ScheduleCandidate]) => <>', (yielded, candidates) =>
+  --   for candidate in *candidates
+  --     if @_already_yielded candidate, yielded
+  --       continue
+  --     @_yield_candidate candidate
 
-  _outbound_local_schedule_candidates: F '(string, {string->[StationAddress]}, [StationAddress]) => [ScheduleCandidate]', (resource, free_inbound_station_addrs_by_network, outbound_station_addrs) =>
-    ret = with {}
-      for outbound_station_addr in *outbound_station_addrs
-        { :factory, :station } = outbound_station_addr
+  -- _already_yielded: F '(ScheduleCandidate, [ScheduleCandidate]) => boolean', (candidate, yielded) =>
+  --   {
+  --     :inbound_station_addr,
+  --     :outbound_station_addr,
+  --     :train_addr,
+  --   } = candidate
+  --   for prior in *yielded
+  --     if prior.inbound_station_addr.station.name != inbound_station_addr.station.name
+  --       continue
+  --     if prior.outbound_station_addr.station.name != outbound_station_addr.station.name
+  --       continue
+  --     if prior.train_addr.name != train_addr.name
+  --       continue
+  --     return true
+  --   false
 
-        for train_name in *outbound_station_addr.station.present_trains
-          if @promise_tracker\train_is_promised train_name
-            continue
+  -- _inbound_station_addrs: F '(string, Factory) => [StationAddress]', (resource, factory) =>
+  --   with {}
+  --     for station in *factory.stations.known
+  --       if station.type != 'inbound'
+  --         continue
+  --       if station.handles != resource
+  --         continue
+  --       if @promise_tracker\station_is_fully_promised station
+  --         continue
+  --       [] = :factory, :station
+  --
+  -- _outbound_station_addrs: F '(string, string, [Factory]) => [StationAddress]', (resource, network, factories) =>
+  --   with {}
+  --     trace "checking among #{#factories} factories"
+  --     for factory in *factories
+  --       trace "inspecting #{factory.name} for #{resource}"
+  --       if not @_factory_has_surplus_resource resource, factory
+  --         trace "factory #{factory.name} does NOT have a surplus of #{resource}"
+  --         continue
+  --
+  --       for station in *factory.stations.known
+  --         if station.handles != resource
+  --           trace "wrong resource (#{station.handles})"
+  --           continue
+  --         if station.type != 'outbound'
+  --           trace "wrong type (#{station.type})"
+  --           continue
+  --         if station.network != network
+  --           trace "wrong network (#{station.network})"
+  --           continue
+  --         if @promise_tracker\station_is_fully_promised station
+  --           trace "fully promised"
+  --           continue
+  --         trace "ok!"
+  --         [] = :factory, :station
+  --
+  -- _factory_has_surplus_resource: F '(string, Factory) => boolean', (resource, factory) =>
+  --   for detected_resource in *factory.stockpile.known
+  --     if detected_resource.name != resource
+  --       continue
+  --     if not detected_resource.surplus_amount?
+  --       continue
+  --     if detected_resource.stored < detected_resource.surplus_amount
+  --       continue
+  --     return true
+  --   false
+  --
+  -- _inbound_local_schedule_candidates: F '(string, Factory, [StationAddress], {string->[StationAddress]}) => [ScheduleCandidate]', (resource, factory, inbound_station_addrs, outbound_station_addrs_by_network) =>
+  --   ret = with {}
+  --     for inbound_station_addr in *inbound_station_addrs
+  --       station = inbound_station_addr.station
+  --       for train_name in *station.present_trains
+  --         if @promise_tracker\train_is_promised train_name
+  --           continue
+  --
+  --         outbound_station_addr = @rand\pick outbound_station_addrs_by_network[station.network]
+  --         if not outbound_station_addr?
+  --           continue
+  --
+  --         [] =
+  --           train_addr:
+  --             name: train_name
+  --             :station
+  --             :factory
+  --           :inbound_station_addr
+  --           :outbound_station_addr
+  --           schedule: @_train_schedule
+  --             inbound_addr: inbound_station_addr
+  --             outbound_addr: outbound_station_addr
+  --           info:
+  --             inbound_factory_name: inbound_station_addr.factory.name
+  --             :resource
+  --   @rand\shuffle ret
+  --   ret
+  --
+  -- _outbound_local_schedule_candidates: F '(string, {string->[StationAddress]}, [StationAddress]) => [ScheduleCandidate]', (resource, free_inbound_station_addrs_by_network, outbound_station_addrs) =>
+  --   ret = with {}
+  --     for outbound_station_addr in *outbound_station_addrs
+  --       { :factory, :station } = outbound_station_addr
+  --
+  --       for train_name in *outbound_station_addr.station.present_trains
+  --         if @promise_tracker\train_is_promised train_name
+  --           continue
+  --
+  --         inbound_station_addrs = free_inbound_station_addrs_by_network[outbound_station_addr.station.network]
+  --         if not inbound_station_addrs? or #inbound_station_addrs == 0
+  --           continue
+  --         inbound_station_addr = @rand\pick inbound_station_addrs
+  --
+  --         [] =
+  --           train_addr:
+  --             name: train_name
+  --             :station
+  --             :factory
+  --           :inbound_station_addr
+  --           :outbound_station_addr
+  --           schedule: @_train_schedule
+  --             inbound_addr: inbound_station_addr
+  --             outbound_addr: outbound_station_addr
+  --           info:
+  --             inbound_factory_name: inbound_station_addr.factory.name
+  --             :resource
+  --   @rand\shuffle ret
+  --   ret
+  --
+  -- _yield_global_schedule_candidates: F '(string, {string->[StationAddress]}, {string->[StationAddress]}, [TrainAddress]) => <>', (resource, free_inbound_station_addrs_by_network, outbound_station_addrs_by_network, train_addrs) =>
+  --   attempts = 0
+  --   while true
+  --     attempts += 1
+  --     if attempts % 50 == 0
+  --       coroutine.yield!
+  --
+  --     train_addr = @rand\pick train_addrs
+  --     if not train_addr?
+  --       break
+  --
+  --     network = train_addr.station.network
+  --
+  --     inbound_station_addrs = free_inbound_station_addrs_by_network[network]
+  --     if not inbound_station_addrs? or #inbound_station_addrs == 0
+  --       continue
+  --     inbound_station_addr = @rand\pick inbound_station_addrs
+  --
+  --     outbound_station_addrs = outbound_station_addrs_by_network[network]
+  --     if not outbound_station_addrs? or #outbound_station_addrs == 0
+  --       continue
+  --     outbound_station_addr = @rand\pick outbound_station_addrs
+  --
+  --     @_yield_candidate
+  --       :train_addr
+  --       :inbound_station_addr
+  --       :outbound_station_addr
+  --       schedule: @_train_schedule
+  --         inbound_addr: inbound_station_addr
+  --         outbound_addr: outbound_station_addr
+  --       info:
+  --         inbound_factory_name: inbound_station_addr.factory.name
+  --         :resource
+  --
+  -- _free_station_addrs_by_network: F '([StationAddress]) => {string->[StationAddress]}', (addrs) =>
+  --   with {}
+  --     for addr in *addrs
+  --       station = addr.station
+  --       if #station.present_trains >= station.capacity
+  --         continue
+  --
+  --       network = station.network
+  --       if not [network]?
+  --         [network] = {addr}
+  --       else
+  --         [network][] = addr
+  --
+  -- _train_schedule: F '({outbound_addr: StationAddress, inbound_addr: StationAddress}) => Schedule', (conf) =>
+  --   { :outbound_addr, :inbound_addr } = conf
+  --   {
+  --     cyclic: false
+  --     entries:
+  --       -- TODO(kcza): rename the schedule (instruction), change type to make conditions specifically be `nil`
+  --       * instruction:
+  --           id: 'create:destination'
+  --           data:
+  --             text: outbound_addr.station.name
+  --         conditions:
+  --           * { @@MIN_WAIT_REACHED, @@CARGO_INACTIVE }
+  --           * { @@MAX_WAIT_REACHED }
+  --       * instruction:
+  --           id: 'create:destination'
+  --           data:
+  --             text: inbound_addr.station.name
+  --         conditions:
+  --           * { @@MAX_WAIT_REACHED }
+  --   }
 
-          inbound_station_addrs = free_inbound_station_addrs_by_network[outbound_station_addr.station.network]
-          if not inbound_station_addrs? or #inbound_station_addrs == 0
-            continue
-          inbound_station_addr = @rand\pick inbound_station_addrs
-
-          [] =
-            train_addr:
-              name: train_name
-              :station
-              :factory
-            :inbound_station_addr
-            :outbound_station_addr
-            schedule: @_train_schedule
-              inbound_addr: inbound_station_addr
-              outbound_addr: outbound_station_addr
-            info:
-              inbound_factory_name: inbound_station_addr.factory.name
-              :resource
-    @rand\shuffle ret
-    ret
-
-  _yield_global_schedule_candidates: F '(string, {string->[StationAddress]}, {string->[StationAddress]}, [TrainAddress]) => <>', (resource, free_inbound_station_addrs_by_network, outbound_station_addrs_by_network, train_addrs) =>
-    attempts = 0
-    while true
-      attempts += 1
-      if attempts % 50 == 0
-        coroutine.yield!
-
-      train_addr = @rand\pick train_addrs
-      if not train_addr?
-        break
-
-      network = train_addr.station.network
-
-      inbound_station_addrs = free_inbound_station_addrs_by_network[network]
-      if not inbound_station_addrs? or #inbound_station_addrs == 0
-        continue
-      inbound_station_addr = @rand\pick inbound_station_addrs
-
-      outbound_station_addrs = outbound_station_addrs_by_network[network]
-      if not outbound_station_addrs? or #outbound_station_addrs == 0
-        continue
-      outbound_station_addr = @rand\pick outbound_station_addrs
-
-      @_yield_candidate
-        :train_addr
-        :inbound_station_addr
-        :outbound_station_addr
-        schedule: @_train_schedule
-          inbound_addr: inbound_station_addr
-          outbound_addr: outbound_station_addr
-        info:
-          inbound_factory_name: inbound_station_addr.factory.name
-          :resource
-
-  _free_station_addrs_by_network: F '([StationAddress]) => {string->[StationAddress]}', (addrs) =>
-    with {}
-      for addr in *addrs
-        station = addr.station
-        if #station.present_trains >= station.capacity
-          continue
-
-        network = station.network
-        if not [network]?
-          [network] = {addr}
-        else
-          [network][] = addr
-
-  _train_schedule: F '({outbound_addr: StationAddress, inbound_addr: StationAddress}) => Schedule', (conf) =>
-    { :outbound_addr, :inbound_addr } = conf
-    {
-      cyclic: false
-      entries:
-        -- TODO(kcza): rename the schedule (instruction), change type to make conditions specifically be `nil`
-        * instruction:
-            id: 'create:destination'
-            data:
-              text: outbound_addr.station.name
-          conditions:
-            * { @@MIN_WAIT_REACHED, @@CARGO_INACTIVE }
-            * { @@MAX_WAIT_REACHED }
-        * instruction:
-            id: 'create:destination'
-            data:
-              text: inbound_addr.station.name
-          conditions:
-            * { @@MAX_WAIT_REACHED }
-    }
-
-  @CARGO_INACTIVE:
-    id: "create:idle"
-    data:
-      value: 5
-      time_unit: time_units.SECONDS
-  @MIN_WAIT_REACHED:
-    id: "create:delay"
-    data:
-      value: 15
-      time_unit: time_units.SECONDS
-  @MAX_WAIT_REACHED:
-    id: "create:delay"
-    data:
-      value: 30
-      time_unit: time_units.SECONDS
-
-  _train_addrs: F '([Factory]) => [TrainAddress]', (factories) =>
-    with {}
-      for factory in *factories
-        for station in *factory.stations.known
-          for name in *station.present_trains
-            if @promise_tracker\train_is_promised name
-              continue
-            [] =
-              :factory
-              :station
-              :name
+  -- _train_addrs: F '([Factory]) => [TrainAddress]', (factories) =>
+  --   with {}
+  --     for factory in *factories
+  --       for station in *factory.stations.known
+  --         for name in *station.present_trains
+  --           if @promise_tracker\train_is_promised name
+  --             continue
+  --           [] =
+  --             :factory
+  --             :station
+  --             :name
 
   _yield_candidate: F '(ScheduleCandidate) => <>', (candidate) =>
     promise = @promise_tracker\promise candidate.train_addr.name,
@@ -467,82 +574,439 @@ export class Scheduler
       outbound_station_addrs_by_network,
       train_addrs
 
+declare_type 'ScheduleGenerator', [[{
+  try_generate_schedule: () => <?ScheduleCandidate, boolean>,
+  schedule_accepted: () => <>,
+}]]
 declare_type 'ScheduleGeneratorOpts', [[{
-
+  parent_sm: StateMachine,
+  scheduler: Scheduler,
+  factories: [Factory],
+  factory: Factory,
+  rand: Random,
+  resource: string,
 }]]
 export class ScheduleGenerator
   new: F '(ScheduleGeneratorOpts) => <>', (opts) =>
-    {:x} = opts
+    { :parent_sm } = opts
+    @parent_sm = parent_sm
+    @inner = ScheduleGeneratorImpl opts
+
+    @done = T 'boolean', false
 
     @sm = @@make_sm!
     @sm_responses = @make_sm_responses @sm
 
   @make_sm: F '() => StateMachine', =>
-    (StateMachineBuilder 'schedule_generator')
-      \set_initial_state 'waiting'
-      \add (State 'waiting')
-        \declare_end_state!
-        \add_transition_to 'generating_inbound_local_schedule'
-      \add (State 'generating_inbound_local_schedule')
-        \add_transition_to 'emitting_inbound_local_schedule'
-        \add_transition_to 'generating_outbound_local_schedule'
-      \add (State 'emitting_inbound_local_schedule')
-        \add_transition_to 'generating_inbound_local_schedule'
-        \add_transition_to 'waiting'
-      \add (State 'generating_outbound_local_schedule')
-        \add_transition_to 'emitting_inbound_outbound_schedule'
-        \add_transition_to 'generating_global_schedule'
-      \add (State 'emitting_inbound_outbound_schedule')
-        \add_transition_to 'generating_outbound_local_schedule'
-        \add_transition_to 'waiting'
-      \add (State 'generating_global_schedule')
-        \add_transition_to 'emitting_global_schedule'
+    @sm_builder ??= (StateMachineBuilder 'schedule_generator')
+      \set_initial_state 'generating_schedules'
+      \set_reporter shallow_log_reporter
+      \add (State 'generating_schedules')
+        \add_transition_to 'proposing_schedule'
         \add_transition_to 'out_of_schedules'
-      \add (State 'emitting_global_schedule')
-        \add_transition_to 'generating_global_schedule'
-        \add_transition_to 'waiting'
+      \add (State 'proposing_schedule')
+        \set_data_type [[{
+          schedule: ScheduleCandidate,
+          schedules: Queue,
+          promise: Promise,
+        }]]
+        \add_transition_to 'generating_schedules'
+        \add_transition_to 'proposing_schedule'
+        \declare_end_state!
       \add (State 'out_of_schedules')
-        \add_transition_to 'waiting'
+        \declare_end_state!
+    @sm_builder\build!
+
+  make_sm_responses: F '(StateMachine) => StateResponses', (sm) =>
+    (StateResponsesBuilder sm)
+      \add 'generating_schedules', @\on_generating_schedules
+      \add 'proposing_schedule', @\on_proposing_schedule
+      \add 'out_of_schedules', @\on_out_of_schedules
+      \build!
+
+  try_generate_schedule: F '() => <?ScheduleCandidate, boolean>', =>
+    @step!
+    states = @sm.states
+    switch @sm.state.name
+      when states.generating_schedules
+        nil, true
+      when states.proposing_schedule
+        @sm.state.schedule, true
+      when states.out_of_schedules
+        nil, false
+      else
+        error "internal error: unexpected state '#{@sm.state.name}'"
+
+  step: F '() => <>', =>
+    if @parent_sm.state.name != 'scheduling'
+      return -- Await stable data.
+    @sm_responses[@sm.state.name]!
+
+  end_generation: F '() => <>', =>
+    @done = true
+    @sm\end!
+
+  on_generating_schedules: F '() => <>', =>
+    @inner\step!
+    states = @inner.sm.states
+    switch @inner.sm.state.name
+      when states.generating_inbound_local_schedules, states.generating_outbound_local_schedules, states.generating_global_schedules
+        if @sm.state.name != 'generating_schedules'
+          @sm\goto 'generating_schedules'
+      when states.proposing_inbound_local_schedules, states.proposing_outbound_local_schedules, states.proposing_global_schedules
+        if @sm.state.name == @sm.states.proposing_schedule
+          prev_schedule = @sm.state.schedule
+          -- TODO(kcza): unpromise previous schedule
+
+        schedules = @inner.sm.state.schedules
+        schedule = schedules\dequeue!
+        if schedule?
+          -- TODO(kcza): promise schedule
+          @sm\goto 'proposing_schedule',
+            :schedule
+            :schedules
+      when states.out_of_schedules
+        @sm\goto 'out_of_schedules'
+      else
+        error "internal error: unexpected inner state '#{@inner.sm.state.name}'"
+
+  on_proposing_schedule: F '() => <>', =>
+    { :schedules } = @sm.state
+    if schedule = schedule\dequeue!
+      @sm\goto 'proposing_schedule',
+        :schedule
+        :schedules
+    else
+      @sm\goto 'generating_schedules'
+
+  on_out_of_schedules: F '() => <>', =>
+
+declare_type 'ScheduleGeneratorImplOpts', [[{
+  factories: [Factory],
+  factory: Factory,
+  promise_tracker: PromiseTracker,
+  rand: Random,
+  resource: string,
+}]]
+export class ScheduleGeneratorImpl
+  new: F '(ScheduleGeneratorImplOpts) => <>', (opts) =>
+    {
+      :factories
+      :factory
+      :rand
+      :resource
+    } = opts
+    @factories = factories
+    @factory = factory
+    @resource = resource
+    @rand = rand
+
+    @proposed_schedules = T '[ScheduleCandidate]', {}
+
+    @sm = @@make_sm!
+    @sm_responses = @make_sm_responses @sm
+
+    @inbound_station_addrs = @_inbound_station_addrs resource, factory
+    networks = with {}
+      seen_networks = {}
+      for inbound_station_addr in *@inbound_station_addrs
+        network = inbound_station_addr.station.network
+        if seen_networks[network]
+          continue
+        seen_networks[network] = true
+        [] = network
+    @free_inbound_station_addrs_by_network = @_free_station_addrs_by_network @inbound_station_addrs
+    @outbound_station_addrs, @outbound_station_addrs_by_network = @_outbound_station_addrs resource, networks, factories
+
+  _inbound_station_addrs: F '(string, Factory) => [StationAddress]', (resource, factory) =>
+    with {}
+      for station in *factory.stations.known
+        if station.type != 'inbound'
+          continue
+        if station.handles != resource
+          continue
+        if @promise_tracker\station_is_fully_promised station
+          continue
+        [] = :factory, :station
+
+  _outbound_station_addrs: F '(string, [string], [Factory]) => <[StationAddress], {string->[StationAddress]}>', (resource, networks, factories) =>
+      addrs = {}
+      addrs_by_network = {}
+      for network in *networks
+        addrs = @_outbound_station_addrs_on_network resource, network, factories
+        addrs_by_network[network] = addrs
+        for addr in *addrs
+          addrs[] = addr
+      addrs, addrs_by_network
+
+  _outbound_station_addrs_on_network: F '(string, string, [Factory]) => [StationAddress]', (resource, network, factories) =>
+    with {}
+      for factory in *factories
+        if not @_factory_has_surplus_resource resource, factory
+          continue
+
+        for station in *factory.stations.known
+          if station.handles != resource
+            continue
+          if station.type != 'outbound'
+            continue
+          if station.network != network
+            continue
+          if @promise_tracker\station_is_fully_promised station
+            continue
+          [] = :factory, :station
+
+  _factory_has_surplus_resource: F '(string, Factory) => boolean', (resource, factory) =>
+    for detected_resource in *factory.stockpile.known
+      if detected_resource.name != resource
+        continue
+      if not detected_resource.surplus_amount?
+        continue
+      if detected_resource.stored < detected_resource.surplus_amount
+        continue
+      return true
+    false
+
+  _free_station_addrs_by_network: F '([StationAddress]) => {string->[StationAddress]}', (addrs) =>
+    with {}
+      for addr in *addrs
+        station = addr.station
+        if #station.present_trains >= station.capacity
+          continue
+
+        network = station.network
+        if not [network]?
+          [network] = {addr}
+        else
+          [network][] = addr
+
+  @make_sm: F '() => StateMachine', =>
+    (StateMachineBuilder 'schedule_generator_impl')
+      \set_initial_state 'generating_inbound_local_schedules'
+      \set_reporter shallow_log_reporter
+      \add (State 'generating_inbound_local_schedules')
+        \add_transition_to 'proposing_inbound_local_schedules'
+        \add_transition_to 'generating_outbound_local_schedules'
+      \add (State 'proposing_inbound_local_schedules')
+        \add_transition_to 'generating_outbound_local_schedules'
+        \declare_end_state!
+      \add (State 'generating_outbound_local_schedules')
+        \add_transition_to 'proposing_outbound_local_schedules'
+        \add_transition_to 'generating_global_schedules'
+      \add (State 'proposing_outbound_local_schedules')
+        \add_transition_to 'generating_global_schedules'
+        \declare_end_state!
+      \add (State 'generating_global_schedules')
+        \add_transition_to 'proposing_global_schedules'
+        \add_transition_to 'out_of_schedules'
+      \add (State 'proposing_global_schedules')
+        \add_transition_to 'out_of_schedules'
+        \declare_end_state!
+      \add (State 'out_of_schedules')
+        \declare_end_state!
       \build!
 
   make_sm_responses: F '(StateMachine) => StateResponses', (sm) =>
     (StateResponsesBuilder sm)
-      \add 'waiting', @\on_waiting
-      \add 'generating_inbound_local_schedule', @\on_generating_inbound_local_schedule
-      \add 'emitting_inbound_local_schedule', @\on_emitting_inbound_local_schedule
-      \add 'generating_outbound_local_schedule', @\on_generating_outbound_local_schedule
-      \add 'emitting_inbound_outbound_schedule', @\on_emitting_inbound_outbound_schedule
-      \add 'generating_global_schedule', @\on_generating_global_schedule
-      \add 'emitting_global_schedule', @\on_emitting_global_schedule
+      \add 'generating_inbound_local_schedules', @\on_generating_inbound_local_schedulse
+      \add 'proposing_inbound_local_schedules', @\on_proposing_inbound_local_schedule
+      \add 'generating_outbound_local_schedules', @\on_generating_outbound_local_schedules
+      \add 'proposing_outbound_local_schedules', @\on_proposing_outbound_local_schedules
+      \add 'generating_global_schedules', @\on_generating_global_schedules
+      \add 'proposing_global_schedules', @\on_proposing_global_schedule
       \add 'out_of_schedules', @\on_out_of_schedules
       \build!
 
   step: F '() => <>', =>
     @sm_responses[@sm.state.name]!
 
-  on_waiting: F '() => <>', =>
-    error 'TODO'
+  on_generating_inbound_local_schedules: F '() => <>', =>
+    schedules = with {}
+      for inbound_station_addr in *@inbound_station_addrs
+        station = inbound_station_addr.station
+        for train_name in *station.present_trains
+          if @promise_tracker\train_is_promised train_name
+            continue
 
-  on_generating_inbound_local_schedule: F '() => <>', =>
-    error 'TODO'
+          outbound_station_addr = @rand\pick @outbound_station_addrs_by_network[station.network]
+          if not outbound_station_addr?
+            continue
 
-  on_emitting_inbound_local_schedule: F '() => <>', =>
-    error 'TODO'
+          [] =
+            train_addr:
+              name: train_name
+              :station
+              factory: @factory
+            :inbound_station_addr
+            :outbound_station_addr
+            schedule: @_train_schedule
+              inbound_addr: inbound_station_addr
+              outbound_addr: outbound_station_addr
+            info:
+              inbound_factory_name: inbound_station_addr.factory.name
+              :resource
+    schedules = @make_schedules_unique schedules
+    if schedules\len! > 0
+      @rand\shuffle schedules
+      @sm\goto 'proposing_inbound_local_schedules',
+        :schedules
+    else
+      @sm\goto 'generating_outbound_local_schedules'
 
-  on_generating_outbound_local_schedule: F '() => <>', =>
-    error 'TODO'
+  on_proposing_inbound_local_schedules: F '() => <>', =>
+    @sm\goto 'generating_inbound_local_schedules'
 
-  on_emitting_inbound_outbound_schedule: F '() => <>', =>
-    error 'TODO'
+  on_generating_outbound_local_schedules: F '() => <>', =>
+    schedules = with {}
+      for outbound_station_addr in *@outbound_station_addrs
+        { :factory, :station } = outbound_station_addr
 
-  on_generating_global_schedule: F '() => <>', =>
-    error 'TODO'
+        for train_name in *outbound_station_addr.station.present_trains
+          if @promise_tracker\train_is_promised train_name
+            continue
 
-  on_emitting_global_schedule: F '() => <>', =>
-    error 'TODO'
+          inbound_station_addrs = @free_inbound_station_addrs_by_network[outbound_station_addr.station.network]
+          if not inbound_station_addrs? or #inbound_station_addrs == 0
+            continue
+          inbound_station_addr = @rand\pick inbound_station_addrs
+
+          [] =
+            train_addr:
+              name: train_name
+              :station
+              :factory
+            :inbound_station_addr
+            :outbound_station_addr
+            schedule: @_train_schedule
+              inbound_addr: inbound_station_addr
+              outbound_addr: outbound_station_addr
+            info:
+              inbound_factory_name: inbound_station_addr.factory.name
+              :resource
+    schedules = @make_schedules_unique schedules
+    if schedules\len! > 0
+      @rand\shuffle schedules
+      @sm\goto 'proposing_outbound_local_schedules',
+        :schedules
+    else
+      @sm\goto 'generating_global_schedules'
+
+  on_proposing_outbound_local_schedules: F '() => <>', =>
+    @sm\goto 'generating_outbound_local_schedules'
+
+  on_generating_global_schedules: F '() => <>', =>
+    train_addrs = @_train_addrs!
+
+    schedules = Queue!
+    for _ = 1, 25
+      train_addr = @rand\pick train_addrs
+      if not train_addr?
+        break
+
+      network = train_addr.station.network
+
+      inbound_station_addrs = @free_inbound_station_addrs_by_network[network]
+      if not inbound_station_addrs? or #inbound_station_addrs == 0
+        continue
+      inbound_station_addr = @rand\pick inbound_station_addrs
+
+      outbound_station_addrs = @outbound_station_addrs_by_network[network]
+      if not outbound_station_addrs? or #outbound_station_addrs == 0
+        continue
+      outbound_station_addr = @rand\pick outbound_station_addrs
+
+      schedule =
+        :train_addr
+        :inbound_station_addr
+        :outbound_station_addr
+        schedule: @_train_schedule
+          inbound_addr: inbound_station_addr
+          outbound_addr: outbound_station_addr
+        info:
+          inbound_factory_name: inbound_station_addr.factory.name
+          :resource
+      if not @_already_proposed schedule
+        schedules\enqueue schedule
+    if schedules\len! > 0
+      @sm\goto 'proposing_global_schedules'
+    else
+      @sm\goto 'out_of_schedules'
+
+  _train_addrs: F '() => [TrainAddress]', =>
+    with {}
+      for factory in *@factories
+        for station in *factory.stations.known
+          for name in *station.present_trains
+            if @promise_tracker\train_is_promised name
+              continue
+            [] =
+              :factory
+              :station
+              :name
+
+  _train_schedule: F '({outbound_addr: StationAddress, inbound_addr: StationAddress}) => Schedule', (conf) =>
+    { :outbound_addr, :inbound_addr } = conf
+    {
+      cyclic: false
+      entries:
+        -- TODO(kcza): rename the schedule (instruction), change type to make conditions specifically be `nil`
+        * instruction:
+            id: 'create:destination'
+            data:
+              text: outbound_addr.station.name
+          conditions:
+            * { @@MIN_WAIT_REACHED, @@CARGO_INACTIVE }
+            * { @@MAX_WAIT_REACHED }
+        * instruction:
+            id: 'create:destination'
+            data:
+              text: inbound_addr.station.name
+          conditions:
+            * { @@MAX_WAIT_REACHED }
+    }
+
+  @CARGO_INACTIVE:
+    id: "create:idle"
+    data:
+      value: 5
+      time_unit: time_units.SECONDS
+  @MIN_WAIT_REACHED:
+    id: "create:delay"
+    data:
+      value: 15
+      time_unit: time_units.SECONDS
+  @MAX_WAIT_REACHED:
+    id: "create:delay"
+    data:
+      value: 30
+      time_unit: time_units.SECONDS
+
+  on_proposing_global_schedules: F '() => <>', =>
+    @sm\goto 'out_of_schedules'
+
+  make_schedules_unique: F '(Queue) => Queue', (schedules) =>
+    with Queue!
+      for schedule in schedules\iter!
+        if not @_already_proposed schedule
+          \enqueue schedule
+
+  _already_proposed: F '(ScheduleCandidate) => <>', (candidate) =>
+    {
+      :inbound_station_addr,
+      :outbound_station_addr,
+      :train_addr,
+    } = candidate
+    for prior in *@proposed_schedules
+      if prior.inbound_station_addr.station.name != inbound_station_addr.station.name
+        continue
+      if prior.outbound_station_addr.station.name != outbound_station_addr.station.name
+        continue
+      if prior.train_addr.name != train_addr.name
+        continue
+      return true
+    false
 
   on_out_of_schedules: F '() => <>', =>
-    error 'TODO'
 
 spec ->
   import 'spec_macros' as $

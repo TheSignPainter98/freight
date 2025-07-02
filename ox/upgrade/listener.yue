@@ -3,7 +3,7 @@ local *
 import 'ox.data.queue' as :Queue
 import 'ox.firewall' as :Firewall
 import 'ox.logger' as :log, :trace
-import 'ox.state' as :State, :StateMachineBuilder, :StateResponsesBuilder
+import 'ox.state' as :shallow_log_reporter, :State, :StateMachineBuilder, :StateResponsesBuilder
 import 'ox.upgrade.instigator' as :MarshalBumpRelease
 import 'ox.upgrade.monitor' as :CurrentReleaseRequest, :CurrentReleaseResponse
 import 'ox.upgrade.rebooter' as :MinecraftRebooter, :RebootRequest
@@ -45,6 +45,7 @@ export class UpgradeListener using Tester
     @firewall = Firewall
       * CurrentReleaseRequest
       * MarshalBumpRelease
+      * RebootRequest
     @events = Queue 'UpgradeListenerEvent'
     @sm = @@make_sm!
     @sm_responses = @make_sm_responses @sm
@@ -52,29 +53,58 @@ export class UpgradeListener using Tester
   @make_sm: F '() => StateMachine', =>
     (StateMachineBuilder 'upgrade_listener')
       \set_initial_state 'waiting'
+      \set_reporter shallow_log_reporter
       \add (State 'waiting')
         \declare_end_state!
         \add_transition_to 'inspecting_packet'
       \add (State 'inspecting_packet')
+        \set_data_type [[{
+          packet: Packet,
+        }]]
         \add_transition_to 'analysing_current_release_request'
         \add_transition_to 'analysing_reboot_request'
         \add_transition_to 'analysing_update'
       \add (State 'analysing_current_release_request')
+        \set_data_type [[{
+          packet: CurrentReleaseRequest,
+        }]]
         \add_transition_to 'sending_current_release_response'
       \add (State 'sending_current_release_response')
+        \set_data_type [[{
+          idemp_tok: IdempotenceToken,
+          recipient_id: number,
+          current_release: Release,
+        }]]
         \add_transition_to 'waiting'
       \add (State 'analysing_reboot_request')
+        \set_data_type [[{
+          packet: RebootRequest,
+        }]]
         \add_transition_to 'rebooting'
       \add (State 'analysing_update')
+        \set_data_type [[{
+          packet: MarshalBumpRelease,
+        }]]
         \add_transition_to 'testing_update'
       \add (State 'testing_update')
+        \set_data_type [[{
+          instigator_id: number,
+          release: Release,
+        }]]
         \add_transition_to 'applying_update'
         \add_transition_to 'rejecting_update'
       \add (State 'applying_update')
+        \set_data_type [[{
+          release: Release,
+        }]]
         \add_transition_to 'broadcasting_reboot'
       \add (State 'broadcasting_reboot')
         \add_transition_to 'rebooting'
       \add (State 'rejecting_update')
+        \set_data_type [[{
+          instigator_id: number,
+          cause: string,
+        }]]
         \add_transition_to 'waiting'
       \add (State 'rebooting')
         \declare_end_state!
@@ -99,80 +129,42 @@ export class UpgradeListener using Tester
     @sm_responses[@sm.state.name]!
 
   on_waiting: F '() => <>', =>
-    error 'TODO'
+    event = @events\dequeue!
+    if not event?
+      return
+    switch event.type
+      when 'network-packet'
+        @sm\goto 'inspecting_packet',
+          packet: event.packet
+      else
+        error "internal error: unrecognised event type '#{event.type}'"
 
   on_inspecting_packet: F '() => <>', =>
-    error 'TODO'
+    { :packet } = @sm.state
+    switch packet.protocol
+      when 'CurrentReleaseResponse'
+        @sm\goto 'analysing_current_release_request',
+          :packet
+      when 'RebootRequest'
+        @sm\goto 'analysing_reboot_request',
+          :packet
+      when 'MarshalBumpRelease'
+        @sm\goto 'analysing_update',
+          :packet
+      else
+        error "internal error: unrecognised protocol '#{event.type}'"
 
   on_analysing_current_release_request: F '() => <>', =>
-    error 'TODO'
-
-  on_sending_current_release_response: F '() => <>', =>
-    error 'TODO'
-
-  on_analysing_reboot_request: F '() => <>', =>
-    error 'TODO'
-
-  on_analysing_update: F '() => <>', =>
-    error 'TODO'
-
-  on_testing_update: F '() => <>', =>
-    error 'TODO'
-
-  on_applying_update: F '() => <>', =>
-    error 'TODO'
-
-  on_broadcasting_reboot: F '() => <>', =>
-    error 'TODO'
-
-  on_rejecting_update: F '() => <>', =>
-    error 'TODO'
-
-  on_rebooting: F '() => <>', =>
-    error 'TODO'
-
-  tasks: F '() => [() -> !]', =>
-    switch @kind
-      when 'leader'
-        @leader_listeners!
-      when 'follower'
-        @follower_listeners!
-      else
-        error "internal error: unknown listener kind '#{@kind}'"
-
-  leader_listeners: F '() => [() -> !]', =>
-    { @\listen_for_release_bumps, @\listen_for_release_requests }
-
-  listen_for_release_bumps: F '() => !', =>
-    log -> "listening for release bumps"
-    local release
-    while true
-      _, { :release } = @uplink\receive_from_any MarshalBumpRelease
-      if #release.content > fs.getFreeSpace '/'
-        error "cannot upgrade: too little space, need #{#release.content}, but only #{fs.getFreeSpace '/'}/#{fs.getCapacity '/'} available"
-
-      ok, err = @test release
-      if ok
-        break
-      trace "cannot apply update: #{err}"
-
-    trace "bumping release to version #{release.version}"
-    @_current_release = release
-    with assert io.open release.file, 'w+'
-      \write release.content
-      assert \close!
-
-    trace "issuing reboot broadcast"
-    @uplink\deafen!
-    @uplink\broadcast RebootRequest!
-    @rebooter\reboot!
-
-  listen_for_release_requests: F '() => !', =>
-    log -> "listening for release requests"
-    while true
-      requester_id, { :idemp_tok } = @uplink\receive_from_any CurrentReleaseRequest
-      trace "sending current release info to ##{requester_id} (idemp_tok:#{idemp_tok})"
-      @uplink\send_to requester_id, CurrentReleaseResponse idemp_tok, @current_release!
+    {
+      packet:
+        :idemp_tok
+        :pc_id
+    } = @sm.state
+    current_release = @current_release!
+    @sm\goto 'sending_current_release_response',
+      :idemp_tok
+      recipient_id: pc_id
+      :current_release
 
   current_release: F '() => Release', =>
     if @kind != 'leader'
@@ -185,13 +177,124 @@ export class UpgradeListener using Tester
         content = assert \read '*a'
         assert \close!
       content
-    @_current_release = T 'Release', file: 'ox', version: VERSION, :content
+    @_current_release = T 'Release',
+      file: 'ox'
+      version: VERSION
+      :content
     @_current_release
 
-  follower_listeners: F '() => [() -> !]', =>
-    log -> "listening for upgrades as follower"
-    { @\listen_for_reboot_requests }
+  on_sending_current_release_response: F '() => <>', =>
+    {
+      :idemp_tok
+      :recipient_id
+      :current_release
+    } = @sm.state
+    @uplink\send_to recipient_id, CurrentReleaseResponse idemp_tok, current_release
+    @sm\goto 'waiting'
 
-  listen_for_reboot_requests: F '() => !', =>
-    @uplink\receive_from_any RebootRequest!
+  on_analysing_reboot_request: F '() => <>', =>
+    { :packet } = @sm.state
+    assert packet -- unused.
+    @sm\goto 'rebooting'
+
+  on_analysing_update: F '() => <>', =>
+    {
+      packet:
+        :pc_id
+        :release
+    } = @sm.state
+    @sm\goto 'testing_update',
+      instigator_id: pc_id
+      :release
+
+  on_testing_update: F '() => <>', =>
+    { :instigator_id, :release } = @sm.state
+    if #release.content > fs.getFreeSpace '/'
+      @sm\goto 'rejecting_update',
+        :instigator_id
+        cause: "cannot upgrade: too little space, need #{#release.content}, but only #{fs.getFreeSpace '/'}/#{fs.getCapacity '/'} available"
+      return
+
+    ok, err = @test release
+    if not ok
+      @sm\goto 'rejecting_update',
+        :instigator_id
+        cause: "cannot upgrade: #{err}"
+      return
+
+    @sm\goto 'applying_update',
+      :release
+
+  on_applying_update: F '() => <>', =>
+    { :release } = @sm.state
+
+    @_current_release = release
+    with assert io.open release.file, 'w+'
+      assert \write release.content
+      assert \close!
+
+    @sm\goto 'broadcasting_reboot'
+
+  on_broadcasting_reboot: F '() => <>', =>
+    @uplink\deafen!
+    @uplink\broadcast RebootRequest!
+    @sm\goto 'rebooting'
+
+  on_rejecting_update: F '() => <>', =>
+    { :instigator_id, :cause } = @sm.state
+    @uplink\send_to instigator_id, UpdateRejection cause
+    @sm\goto 'waiting'
+
+  on_rebooting: F '() => <>', =>
     @rebooter\reboot!
+
+  -- tasks: F '() => [() -> !]', =>
+  --   switch @kind
+  --     when 'leader'
+  --       @leader_listeners!
+  --     when 'follower'
+  --       @follower_listeners!
+  --     else
+  --       error "internal error: unknown listener kind '#{@kind}'"
+  --
+  -- leader_listeners: F '() => [() -> !]', =>
+  --   { @\listen_for_release_bumps, @\listen_for_release_requests }
+  --
+  -- listen_for_release_bumps: F '() => !', =>
+  --   log -> "listening for release bumps"
+  --   local release
+  --   while true
+  --     _, { :release } = @uplink\receive_from_any MarshalBumpRelease
+  --     if #release.content > fs.getFreeSpace '/'
+  --       error "cannot upgrade: too little space, need #{#release.content}, but only #{fs.getFreeSpace '/'}/#{fs.getCapacity '/'} available"
+  --
+  --     ok, err = @test release
+  --     if ok
+  --       break
+  --     trace "cannot apply update: #{err}"
+  --
+  --   trace "bumping release to version #{release.version}"
+  --   @_current_release = release
+  --   with assert io.open release.file, 'w+'
+  --     \write release.content
+  --     assert \close!
+  --
+  --   trace "issuing reboot broadcast"
+  --   @uplink\deafen!
+  --   @uplink\broadcast RebootRequest!
+  --   @rebooter\reboot!
+  --
+  -- listen_for_release_requests: F '() => !', =>
+  --   log -> "listening for release requests"
+  --   while true
+  --     requester_id, { :idemp_tok } = @uplink\receive_from_any CurrentReleaseRequest
+  --     trace "sending current release info to ##{requester_id} (idemp_tok:#{idemp_tok})"
+  --     @uplink\send_to requester_id, CurrentReleaseResponse idemp_tok, @current_release!
+  --
+  -- follower_listeners: F '() => [() -> !]', =>
+  --   log -> "listening for upgrades as follower"
+  --   { @\listen_for_reboot_requests }
+  --
+  -- listen_for_reboot_requests: F '() => !', =>
+  --   @uplink\receive_from_any RebootRequest!
+  --   @rebooter\reboot!

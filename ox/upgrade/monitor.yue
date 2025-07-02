@@ -10,9 +10,21 @@ import 'quicktype' as :declare_type, :F
 declare_type 'UpgradeMonitorConfig', [[{
   marshal: ?{},
 }]]
-
+declare_type 'UpgradeMonitorOpts', [[{
+  config: UpgradeMonitorConfig,
+  pc: Pc,
+  uplink: Uplink,
+}]]
 export class UpgradeMonitor
-  new: F '(UpgradeMonitorConfig, Uplink) => <>', (config, @uplink) =>
+  new: F '(UpgradeMonitorOpts) => <>', (opts) =>
+    {
+      :config
+      :pc
+      :uplink
+    } = opts
+    @pc = pc
+    @uplink = uplink
+
     @is_marshal = config.marshal?
     @new_release = nil
 
@@ -42,7 +54,7 @@ export class UpgradeMonitor
       if attempt > 1
         trace "getting release from marshal, attempt #{attempt}"
 
-      @uplink\broadcast CurrentReleaseRequest idemp_tok
+      @uplink\broadcast CurrentReleaseRequest idemp_tok, @pc\id!
       marshal_id, pkt_or_err = @uplink\receive_from_any CurrentReleaseResponse, timeout: 10
       if not marshal_id?
         if pkt_or_err != TIMEOUT
@@ -57,8 +69,12 @@ export class UpgradeMonitor
         return pkt_or_err.release
       trace "expected #{idemp_tok} but got #{pkt_or_err.idemp_tok} (match? #{pkt_or_err.idemp_tok == idemp_tok})"
 
+declare_type 'CurrentReleaseRequest', [[{
+  idemp_tok: number,
+  pc_id: number,
+}]]
 export class CurrentReleaseRequest extends Packet
-  new: F '(IdempotenceToken) => <>', (@idemp_tok) =>
+  new: F '(IdempotenceToken, number) => <>', (@idemp_tok, @pc_id) =>
     super!
 
 export class CurrentReleaseResponse extends Packet

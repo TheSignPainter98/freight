@@ -24,7 +24,8 @@ export subcommand = with Subcommand 'start'
     \short nil
 
 export main = F '({}) -> <>', (args) ->
-  log -> "starting ox on pc ##{Pc!\id!}"
+  pc = Pc!
+  log -> "starting ox on pc ##{pc\id!}"
 
   cfg, err = config!
   if err?
@@ -35,7 +36,7 @@ export main = F '({}) -> <>', (args) ->
     return
 
   if not args.allow_outdated
-    with UpgradeMonitor cfg, Uplink!
+    with UpgradeMonitor config: cfg, :pc, uplink: Uplink!
       if \upgrade_available!
         \upgrade_now!
 

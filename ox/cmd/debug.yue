@@ -13,12 +13,15 @@ state_machines = T '{string->()->string}'
   ['marshal-resource_orchestrator']: ->
     import 'ox.nodes.marshal.resource_orchestrator.main' as :ResourceOrchestrator
     ResourceOrchestrator::make_sm!
-  ['marshal-schedule_generator']: ->
-    import 'ox.nodes.marshal.resource_orchestrator.scheduler' as :ScheduleGenerator
-    ScheduleGenerator::make_sm!
   ['marshal-scheduler']: ->
     import 'ox.nodes.marshal.resource_orchestrator.scheduler' as :Scheduler
     Scheduler::make_sm!
+  ['marshal-schedule_generator']: ->
+    import 'ox.nodes.marshal.resource_orchestrator.scheduler' as :ScheduleGenerator
+    ScheduleGenerator::make_sm!
+  ['marshal-schedule_generator_impl']: ->
+    import 'ox.nodes.marshal.resource_orchestrator.scheduler' as :ScheduleGeneratorImpl
+    ScheduleGeneratorImpl::make_sm!
   ['upgrade_listener']: ->
     import 'ox.upgrade.listener' as :UpgradeListener
     UpgradeListener::make_sm!

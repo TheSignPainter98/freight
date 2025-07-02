@@ -3,21 +3,46 @@ local *
 import 'ox.data.queue' as :Queue
 import 'ox.firewall' as :Firewall
 import 'ox.nodes.factory.main' as :FactoryHeartbeat, :ScheduleRequest, :ScheduleResponse
-import 'ox.state' as :State, :StateMachineBuilder, :StateResponsesBuilder
-import 'quicktype' as :declare_type, :F
+import 'ox.state' as :shallow_log_reporter, :State, :StateMachineBuilder, :StateResponsesBuilder
+import 'quicktype' as :declare_type, :F, :T
 
-declare_type 'ResourceOrchestrator', 'NetworkComponent'
-declare_type 'ResoruceOrchestratorEvent', [[{
+declare_type 'ResourceOrchestrator', [[
+  NetworkComponent + {
+    factory: (string) => ?Factory,
+    train_is_known: (string) => boolean,
+  }
+]]
+declare_type 'ResourceOrchestratorEvent', [[{
   type: "network-packet",
   packet: Packet,
+} | {
+  type: "new-epoch",
+  new_epoch: number,
+} | {
+  type: "new-config",
+  config: MarshalConfig,
 }]]
-declare_type 'ResourceOrchestratorOpts', [[{}]]
+declare_type 'ResourceOrchestratorOpts', [[{
+  clock: Clock,
+  config: MarshalConfig,
+}]]
 export class ResourceOrchestrator
   new: F '(ResourceOrchestratorOpts) => <>', (opts) =>
-    { :x } = opts
+    {
+      :clock
+      :config
+    } = opts
+    @clock = clock
+    @config = config
+
+    @epoch = T 'number', 0
+    -- TODO(kcza): load from stored initial state
+    @factories = T '{string->Factory}', {}
+    @trains = T '{string->TrainStatus}', {}
 
     @firewall = Firewall
       * FactoryHeartbeat
+      * ScheduleResponse
     @events = Queue 'ResourceOrchestratorEvent'
     @sm = @@make_sm!
     @sm_responses = @make_sm_responses @sm
@@ -25,77 +50,416 @@ export class ResourceOrchestrator
   make_sm: F '() => StateMachine', =>
     (StateMachineBuilder 'resource_orchestrator')
       \set_initial_state 'waiting'
+      \set_reporter shallow_log_reporter
       \add (State 'waiting')
         \declare_end_state!
         \add_transition_to 'inspecting_packet'
+        \add_transition_to 'changing_epoch'
+        \add_transition_to 'applying_config'
       \add (State 'inspecting_packet')
+        \set_data_type [[{
+          packet: Packet
+        }]]
         \add_transition_to 'analysing_factory_heartbeat'
       \add (State 'analysing_factory_heartbeat')
+        \set_data_type [[{
+          packet: FactoryHeartbeat,
+        }]]
         \add_transition_to 'managing_resources'
         \add_transition_to 'waiting'
       \add (State 'managing_resources')
+        \set_data_type [[{
+          factory: Factory,
+          low_resources: Queue,
+        }]]
         \add_transition_to 'managing_resource'
         \add_transition_to 'waiting'
       \add (State 'managing_resource')
+        \set_data_type [[{
+          factory: Factory,
+          low_resources: Queue,
+          low_resource: string,
+        }]]
         \add_transition_to 'generating_schedule'
       \add (State 'generating_schedule')
+        \set_data_type [[{
+          factory: Factory,
+          low_resources: Queue,
+          low_resource: string,
+          schedule_generator: ScheduleGenerator,
+          attempt: number,
+        }]]
         \add_transition_to 'sending_schedule'
         \add_transition_to 'managing_resources'
       \add (State 'sending_schedule')
+        \set_data_type [[{
+          factory: Factory,
+          low_resources: Queue,
+          low_resource: string,
+          schedule_generator: ScheduleGenerator,
+          attempt: number,
+          candidate: ScheduleCandidate,
+        }]]
         \add_transition_to 'awaiting_schedule_response'
       \add (State 'awaiting_schedule_response')
+        \set_data_type [[{
+          factory: Factory,
+          low_resources: Queue,
+          low_resource: string,
+          schedule_generator: ScheduleGenerator,
+          attempt: number,
+          idemp_tok: IdempotenceToken,
+          deadline: number,
+        }]]
+        \add_transition_to 'analysing_schedule_response'
+        \add_transition_to 'schedule_not_applied'
+      \add (State 'analysing_schedule_response')
+        \set_data_type [[{
+          factory: Factory,
+          low_resources: Queue,
+          low_resource: string,
+          schedule_generator: ScheduleGenerator,
+          attempt: number,
+          packet: ScheduleResponse,
+        }]]
         \add_transition_to 'schedule_applied'
         \add_transition_to 'schedule_not_applied'
       \add (State 'schedule_applied')
+        \set_data_type [[{
+          factory: Factory,
+          low_resources: Queue,
+        }]]
         \add_transition_to 'managing_resources'
       \add (State 'schedule_not_applied')
+        \set_data_type [[{
+          factory: Factory,
+          low_resources: Queue,
+          low_resource: string,
+          schedule_generator: ScheduleGenerator,
+          attempt: number,
+          cause: string,
+        }]]
         \add_transition_to 'generating_schedule'
         \add_transition_to 'managing_resources'
+      \add (State 'changing_epoch')
+        \set_data_type [[{
+          new_epoch: number,
+        }]]
+        \add_transition_to 'waiting'
+      \add (State 'applying_config')
+        \set_data_type [[{
+          config: MarshalConfig
+        }]]
+        \add_transition_to 'waiting'
       \build!
 
   make_sm_responses: F '(StateMachine) => StateResponses', (sm) =>
     (StateResponsesBuilder sm)
       \add 'waiting', @\on_waiting
       \add 'inspecting_packet', @\on_inspecting_packet
+      \add 'changing_epoch', @\on_changing_epoch
+      \add 'applying_config', @\on_applying_config
       \add 'analysing_factory_heartbeat', @\on_analysing_factory_heartbeat
       \add 'managing_resources', @\on_managing_resources
       \add 'managing_resource', @\on_managing_resource
       \add 'generating_schedule', @\on_generating_schedule
       \add 'sending_schedule', @\on_sending_schedule
       \add 'awaiting_schedule_response', @\on_awaiting_schedule_response
+      \add 'analysing_schedule_response', @\on_analysing_schedule_response
       \add 'schedule_applied', @\on_schedule_applied
       \add 'schedule_not_applied', @\on_schedule_not_applied
       \build!
+
+  factory: F '(string) => ?Factory', (name) =>
+    @factories[name]
+
+  train_is_known: F '(string) => boolean', (train_name) =>
+    @trains[train_name]?
 
   step: F '() => <>', =>
     @sm_responses[@sm.state.name]!
 
   on_waiting: F '() => <>', =>
-    error 'TODO'
+    event = @events\dequeue!
+    if not event?
+      return
+    switch event.type
+      when 'network-packet'
+        @sm\goto 'inspecting_packet',
+          packet: event.packet
+      when 'new-epoch'
+        @sm\goto 'changing_epoch'
+          new_epoch: event.new_epoch
+      when 'new-config'
+        @sm\goto 'changing_config',
+          config: event.config
+      else
+        error "internal error: unrecognised event type '#{event.type}'"
 
   on_inspecting_packet: F '() => <>', =>
-    error 'TODO'
+    { :packet } = @sm.state
+    switch packet.protocol
+      when 'FactoryHeartbeat'
+        @sm\goto 'analysing_factory_heartbeat',
+          :packet
+      when 'ScheduleResponse'
+        log -> "ignoring unexpected ScheduleResponse"
+        @sm\goto 'waiting'
+      else
+        error "internal error: unrecognised protocol '#{event.type}'"
 
   on_analysing_factory_heartbeat: F '() => <>', =>
-    error 'TODO'
+    { :packet } = @sm.state
+    factory = @update_system_state packet
+    low_resources = @get_low_resources_queue factory.stockpile
+    if low_resources\len! == 0
+      @sm\goto 'waiting'
+      return
+    @sm\goto 'managing_resources',
+      :factory
+      :low_resources
+
+  update_system_state: F '(FactoryHeartbeat) => Factory', (heartbeat) =>
+    { :pc_id, :name, :stations, :stockpile } = heartbeat
+
+    factory_status = @factories[name]
+    seen_before = factory_status?
+    @factories[name] = T 'Factory', with factory_status ?? :name, :pc_id
+      if seen_before and pc_id != .pc_id
+        log -> "temporarily ignoring possible imposter for factory #{name}: last known PC was ##{.pc_id}, got #{pc_id}"
+        return
+
+      .last_seen_epoch = @epoch
+      .stations = stations
+      .present_trains = present_trains
+      .stockpile = stockpile
+
+    for station in *stations.known
+      for present_train in *station.present_trains
+        @declare_train_seen present_train, name, station.name
+    for station in *stations.unknown
+      for present_train in *station.present_trains
+        @declare_train_seen present_train, name, station.name
+
+    @factories[name]
+
+  declare_train_seen: F '(string, string, string) => <>', (train_name, factory_name, station_name) =>
+    @trains[train_name] = T 'TrainStatus', with @trains[train_name] ?? name: train_name
+      .last_seen_epoch = @epoch
+      .last_seen_at_factory = factory_name
+      .last_seen_at_station = station_name
+    @promise_tracker\declare_train_seen train_name, station_name
+
+  get_low_resources_queue: F '(DetectedStockpile) => Queue', (stockpile) =>
+    with Queue 'string'
+      for resource in *stockpile.known
+        if not resource.shortage_amount?
+          continue
+        if resource.stored >= resource.shortage_amount
+          continue
+        \enqueue .name
 
   on_managing_resources: F '() => <>', =>
-    error 'TODO'
+    { :factory, :low_resources } = @sm.state
+    low_resource = low_resources\dequeue!
+    if not low_resource?
+      @sm\goto 'waiting'
+      return
+    if @scheduler\is_on_cooldown factory.name, low_resource
+      log -> "skipping scheduling: factory #{factory.name} is on a #{low_resource} cooldown"
+      return -- No state transition.
+    @sm\goto 'managing_resource',
+      :factory
+      :low_resources
+      :low_resource
 
   on_managing_resource: F '() => <>', =>
-    error 'TODO'
+    { :factory, :low_resources, :low_resource} = @sm.state
+    schedule_generator = @scheduler\schedule_generator low_resource,
+      factory,
+      @factories
+    @sm\goto 'generating_schedule'
+      :factory
+      :low_resources
+      :low_resource
+      :schedule_generator
+      attempt: 1
 
   on_generating_schedule: F '() => <>', =>
-    error 'TODO'
+    {
+      :factory
+      :low_resources
+      :low_resource
+      :schedule_generator
+      :attempt
+    } = @sm.state
+    candidate, can_continue = @schedule_generator\try_generate_schedule!
+    if not candidate?
+      if can_continue
+        return -- No state change.
+      @sm\goto 'managing_resources',
+        :factory
+        :low_resources
+      return
+    @sm\goto 'sending_schedule',
+      :factory
+      :low_resources
+      :low_resource
+      :schedule_generator
+      :attempt
+      :candidate
 
   on_sending_schedule: F '() => <>', =>
-    error 'TODO'
+    {
+      :factory
+      :low_resources
+      :low_resource
+      :schedule_generator
+      :attempt
+      :candidate
+    } = @sm.state
+    {
+      train_addr:
+        factory:
+          name: factory_name
+          pc_id: factory_pc_id
+        station:
+          name: station_name
+        name: train_name
+      :schedule
+    } = candidate
+    idemp_tok = IdempotenceToken!
+
+    deadline = @clock\now! + 1
+    @uplink\send_to factory_pc_id, ScheduleRequest idemp_tok, station_name, train_name, schedule
+    @sm\goto 'awaiting_schedule_response',
+      :factory
+      :low_resources
+      :low_resource
+      :schedule_generator
+      :attempt
+      :idemp_tok
+      :deadline
 
   on_awaiting_schedule_response: F '() => <>', =>
-    error 'TODO'
+    {
+      :factory
+      :low_resources
+      :low_resource
+      :schedule_generator
+      :attempt
+      :idemp_tok
+      :deadline
+    } = @sm.state
+    if @clock\now! > deadline
+      @sm\goto 'schedule_not_applied',
+        :factory
+        :low_resources
+        :low_resource
+        :schedule_generator
+        :attempt
+        cause: 'request timeout'
+      return
+
+    event = @events\extract F '(ResourceOrchestratorEvent) -> boolean', (event) ->
+      if event.type != 'network-packet'
+        return false
+      packet = event.packet
+      if packet.protocol != 'ScheduleResponse'
+        return false
+      if packet.idemp_tok != idemp_tok
+        return false
+      true
+    if not event?
+      return -- No state change.
+    { :packet } = event
+    @sm\goto 'analysing_schedule_response',
+      :factory
+      :low_resources
+      :low_resource
+      :schedule_generator
+      :attempt
+      :packet
+
+  on_analysing_schedule_response: F '() => <>', =>
+    {
+      :factory
+      :low_resources
+      :low_resource
+      :schedule_generator
+      :attempt
+      :packet
+    } = @sm.state
+    { :error_reason } = packet
+    if error_reason?
+      @sm\goto 'schedule_not_applied'
+        :factory
+        :low_resources
+        :low_resource
+        :schedule_generator
+        :attempt
+        cause: error_reason
+    else
+      schedule_generator\end_generation!
+      @sm\goto 'schedule_applied',
+        :factory
+        :low_resources
 
   on_schedule_applied: F '() => <>', =>
-    error 'TODO'
+    { :factory, :low_resources } = @sm.state
+    @sm\goto 'managing_resources',
+      :factory
+      :low_resources
 
   on_schedule_not_applied: F '() => <>', =>
-    error 'TODO'
+    {
+      :factory
+      :low_resources
+      :low_resource
+      :schedule_generator
+      :attempt
+      :cause
+    } = @sm.state
+    log ->
+      "failed to arrange delivery of #{low_resource} to #{factory.name}: #{cause}"
+    if attempt >= 10
+      log -> "cannot arrange delivery of #{low_resource} to #{factory.name}, giving up after #{attempt} attempts"
+      schedule_generator\end_generation!
+      @sm\goto 'managing_resources',
+        :factory
+        :low_resources
+      return
+    @sm\goto 'generating_schedule',
+      :factory
+      :low_resources
+      :low_resource
+      :schedule_generator
+      attempt: attempt + 1
+
+  on_changing_epoch: F '() => <>', =>
+    { :new_epoch } = @sm.state
+    @epoch = new_epoch
+    @prune_factories!
+    @prune_trains!
+    @sm\goto 'waiting'
+
+  prune_factories: F '() => <>', =>
+    LIFETIME_EPOCHS = 1
+    @factories = T '{string->Factory}', @prune_statuses @factories, LIFETIME_EPOCHS
+
+  prune_trains: F '() => <>', =>
+    LIFETIME_EPOCHS = 10
+    @trains = T '{string->TrainStatus}', @prune_statuses @trains, LIFETIME_EPOCHS
+
+  prune_statuses: F '({string->{last_seen_epoch: number}}, number) => {string->{}}', (statuses, lifetime_epochs) =>
+    death_horizon_epoch = @epoch - lifetime_epochs
+    with {}
+      for name, status in pairs statuses
+        if status.last_seen_epoch < death_horizon_epoch
+          continue -- Prune
+        [name] = status
+
+  on_applying_config: F '() => <>', =>
+    { :config } = @sm.state
+    @config = config
+    @sm\goto 'waiting'

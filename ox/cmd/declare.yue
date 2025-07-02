@@ -61,11 +61,11 @@ class Declarer
 declare_type 'DeclareTrainState', [[{
   idemp_tok: IdempotenceToken,
   pc_id: number,
-  name: string,
+  train_name: string,
   state: TrainState,
 }]]
 export class DeclareTrainState extends Packet
-  new: F '(IdempotenceToken, number, string, TrainState) => <>', (@idemp_tok, @pc_id, @name, @state) =>
+  new: F '(IdempotenceToken, number, string, TrainState) => <>', (@idemp_tok, @pc_id, @train_name, @state) =>
     super!
 
 export class DeclareTrainStateResponse extends Packet

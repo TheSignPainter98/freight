@@ -32,6 +32,14 @@
 
 {{#state-machine-spec ../../../ox/nodes/marshal/resource_orchestrator/scheduler.yue schedule_generator}}
 
+## `schedule_generator_impl`
+
+```mermaid
+{{#include state-machine-diagrams/marshal-schedule_generator_impl.mmd}}
+```
+
+{{#state-machine-spec ../../../ox/nodes/marshal/resource_orchestrator/scheduler.yue schedule_generator_impl}}
+
 ## `upgrade_listener`
 
 ```mermaid

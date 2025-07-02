@@ -121,7 +121,7 @@ export class StateMachineBuilder
         if ended
           error "internal error: cannot transition ended state machine"
         if not states[@state.name]?._transitions[name]
-          error "no such transition: #{@state.name} -> #{name}"
+          error "#{@name}: no such transition: #{@state.name} -> #{name}"
         new_state_spec = states[name]
         if not new_state_spec?
           error "internal error: no such state '#{name}'"
@@ -288,7 +288,7 @@ export class StateResponsesBuilder
 
     @responses
 
-export data_log_reporter = (prev_state, state) =>
+export shallow_log_reporter = (prev_state, state) =>
   log ->
     fragments = with {}
       [] = '$ '

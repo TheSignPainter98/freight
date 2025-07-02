@@ -4,7 +4,7 @@ local *
 
 import 'compat' as :HOST
 import 'ox.clock' as :MinecraftClock
-import 'ox.cmd.declare' as :DeclareTrainStateResponse
+import 'ox.cmd.declare' as :DeclareTrainState, :DeclareTrainStateResponse
 import 'ox.configurator.listener' as :ConfigListener
 import 'ox.configurator.main' as :GetConfigResponse, :MarshalIdentityRequest, :MarshalIdentityResponse, :SetConfigResponse
 import 'ox.data.queue' as :Queue
@@ -17,7 +17,7 @@ import 'ox.nodes.marshal.resource_orchestrator.scheduler' as :Scheduler
 import 'ox.nodes.marshal.util.pseudo_random' as :PseudoRandom
 import 'ox.pc' as :Pc
 import 'ox.peripheral.uplink' as :IdempotenceToken, :Packet, :TestUplinkBackend, :TIMEOUT, :Uplink
-import 'ox.state' as :State, :StateMachineBuilder, :StateResponsesBuilder
+import 'ox.state' as :shallow_log_reporter, :State, :StateMachineBuilder, :StateResponsesBuilder
 import 'ox.upgrade.listener' as :UpgradeListener
 import 'quicktype' as :declare_type, :F, :is, :T
 import 'spec' as :running_tests, :spec
@@ -75,18 +75,14 @@ declare_type 'MarshalConfig', [[{
     resend_cooldown_seconds: ?number,
   },
 }]]
-declare_type 'MarshalEventType', [[
-  "new-epoch"
-  |"network-packet"
-]]
 declare_type 'MarshalEvent', [[{
   type: "network-packet",
   packet: Packet,
 } | {
   type: "new-epoch",
-  epoch: number,
+  new_epoch: number,
 } | {
-  type: "change-config",
+  type: "new-config",
   config: MarshalConfig,
 }]]
 declare_type 'StationAddress', [[{
@@ -136,22 +132,17 @@ export class Marshal
       :rand=PseudoRandom!,
       :clock=MinecraftClock!
     } = opts
+    @config = config -- TODO(kcza): changes may still be in the pipeline on reloads.
     @pc = pc
     @uplink = uplink
+    @rand = rand
     @clock = clock
 
-    @set_config config
-    @epoch = T 'number', 0
-    -- TODO(kcza): load from stored initial state
-    @factories = T '{string->Factory}', {}
-    @trains = T '{string->TrainStatus}', {}
-    @rand = rand
-    @promise_tracker = PromiseTracker @rand, @clock
-    @scheduler = Scheduler
-      clock: @clock
-      resend_cooldown_seconds: @config.resend_cooldown_seconds
-      rand: @rand
-      promise_tracker: @promise_tracker
+    @scheduler = T 'Scheduler',
+      Scheduler
+        clock: @clock
+        resend_cooldown_seconds: @config.resend_cooldown_seconds
+        rand: @rand
 
     @do_count_epochs = T 'boolean', true
     @throttle = T 'boolean', HOST == 'minecraft'
@@ -159,42 +150,91 @@ export class Marshal
     @events = T 'Queue', Queue 'MarshalEvent'
 
     @resource_orchestrator = T 'ResourceOrchestrator',
-      ResourceOrchestrator {}
+      ResourceOrchestrator
+        :clock
+        :config
     @upgrade_listener = T 'UpgradeListener',
       UpgradeListener
         :config
         :uplink
     @config_listener = T 'ConfigListener',
       ConfigListener
+        config_type: 'MarshalConfig'
         target: @
         :uplink
 
+    @child_components = T '[Component]',
+      * @scheduler
+      * @resource_orchestrator
+      * @upgrade_listener
+      * @config_listener
+
     allowed_packet_types =
       * MarshalIdentityRequest
+      * DeclareTrainState
     @firewall = with Firewall allowed_packet_types
-      \add_child @resource_orchestrator.firewall
-      \add_child @upgrade_listener.firewall
-      \add_child @config_listener.firewall
+      for child_component in *@child_components
+        \add_child child_component.firewall
     @sm = @@make_sm!
     @sm_responses = @make_sm_responses @sm
 
   @make_sm: F '() => StateMachine', =>
     (StateMachineBuilder 'marshal')
       \set_initial_state 'waiting'
+      \set_reporter shallow_log_reporter
       \add (State 'waiting')
         \add_transition_to 'inspecting_packet'
         \add_transition_to 'changing_epoch'
         \add_transition_to 'applying_config'
         \declare_end_state!
       \add (State 'inspecting_packet')
+        \set_data_type [[{
+          packet: Packet,
+        }]]
         \add_transition_to 'analysing_marshal_identity_request'
+        \add_transition_to 'analysing_declare_train_state'
+        \add_transition_to 'waiting'
       \add (State 'analysing_marshal_identity_request')
+        \set_data_type [[{
+          packet: MarshalIdentityRequest,
+        }]]
         \add_transition_to 'sending_marshal_identity_response'
       \add (State 'sending_marshal_identity_response')
+        \set_data_type [[{
+          idemp_tok: IdempotenceToken,
+          recipient_id: number,
+          resp: number|string,
+        }]]
+        \add_transition_to 'waiting'
+      \add (State 'analysing_declare_train_state')
+        \set_data_type [[{
+          packet: DeclareTrainState,
+        }]]
+        \add_transition_to 'enqueueing_declare_train_state'
+      \add (State 'enqueueing_declare_train_state')
+        \set_data_type [[{
+          idemp_tok: IdempotenceToken,
+          pc_id: number,
+          train_name: string,
+          state: TrainState,
+        }]]
+        \add_transition_to 'sending_declare_train_state_response'
+      \add (State 'sending_declare_train_state_response')
+        \set_data_type [[{
+          idemp_tok: IdempotenceToken,
+          recipient_id: number,
+          error_reason: ?string
+        }]]
         \add_transition_to 'waiting'
       \add (State 'changing_epoch')
+        \set_data_type [[{
+          new_epoch: number,
+        }]]
         \add_transition_to 'waiting'
       \add (State 'applying_config')
+        \set_data_type [[{
+          config: MarshalConfig,
+        }]]
         \add_transition_to 'waiting'
       \build!
 
@@ -204,122 +244,237 @@ export class Marshal
       \add 'inspecting_packet', @\on_inspecting_packet
       \add 'analysing_marshal_identity_request', @\on_analysing_marshal_identity_request
       \add 'sending_marshal_identity_response', @\on_sending_marshal_identity_response
+      \add 'analysing_declare_train_state', @\on_analysing_declare_train_state
+      \add 'enqueueing_declare_train_state', @\on_enqueueing_declare_train_state
+      \add 'sending_declare_train_state_response', @\on_sending_declare_train_state_response
       \add 'changing_epoch', @\on_changing_epoch
       \add 'applying_config', @\on_applying_config
       \build!
 
   step: F '() => <>', =>
     @sm_responses[@sm.state.name]!
-    @resource_orchestrator\step!
-    @upgrade_listener\step!
-    @config_listener\step!
+    for child_component in *@child_components
+      child_component\step!
 
   on_waiting: F '() => <>', =>
-    error 'TODO'
+    event = @events\dequeue!
+    if not event?
+      return
+    switch event.type
+      when 'network-packet'
+        @sm\goto 'inspecting_packet',
+          packet: event.packet
+      when 'new-epoch'
+        @sm\goto 'changing_epoch',
+          new_epoch: event.new_epoch
+      when 'new-config'
+        @sm\goto 'applying_config',
+          config: event.config
+      else
+        error "internal error: unrecognised event type '#{event.type}'"
 
   on_inspecting_packet: F '() => <>', =>
-    error 'TODO'
+    { :packet } = @sm.state
+
+    forwarded = false
+    for child_component in *@child_components
+      if child_component.firewall\permits packet
+        forwarded = true
+        child_component.events\enqueue
+          type: 'network-packet'
+          :packet
+
+    switch packet.protocol
+      when 'MarshalIdentityRequest'
+        @sm\goto 'analysing_marshal_identity_request'
+          :packet
+      when 'DeclareTrainState'
+        @sm\goto 'analysing_declare_train_state',
+          :packet
+      else
+        if not forwarded
+          import 'spec' as :repr
+          error "internal error: unhandled packet admitted through firewall: #{repr protocol}"
+        @sm\goto 'waiting'
 
   on_analysing_marshal_identity_request: F '() => <>', =>
-    error 'TODO'
+    {
+      packet:
+        :idemp_tok
+        :pc_id
+        :name
+    } = @sm.state
+
+    local resp
+    if not name?
+      resp = @pc\id!
+    else if id = (@resource_orchestrator\factory name)?.pc_id
+      resp = id
+    else
+      resp = "no known factory '#{name}'"
+
+    @sm\goto 'sending_marshal_identity_response',
+      :idemp_tok
+      recipient_id: pc_id
+      :resp
 
   on_sending_marshal_identity_response: F '() => <>', =>
-    error 'TODO'
+    {
+      :idemp_tok
+      :recipient_id
+      :resp
+    } = @sm.state
+    @uplink\send_to recipient_id, MarshalIdentityResponse idemp_tok, resp
+    @sm\goto 'waiting'
+
+  on_analysing_declare_train_state: F '() => <>', =>
+    {
+      packet:
+        :idemp_tok
+        :pc_id
+        :train_name
+        :state
+    } = @sm.state
+    @sm\goto 'enqueueing_declare_train_state',
+      :idemp_tok,
+      :pc_id
+      :train_name
+      :state
+
+  on_enqueueing_declare_train_state: F '() => <>', =>
+    {
+      :idemp_tok
+      :pc_id
+      :train_name
+      :state
+    } = @sm.state
+
+    error_reason = nil
+    if state == 'cleared'
+      if @resource_orchestrator\train_is_known train_name
+        error_reason = 'train unknown'
+      else if not @scheduler\train_is_lost train_name
+        error_reason = 'train was not lost'
+
+    @scheduler.events\enqueue
+      type: 'declare-train-state'
+      :train_name
+      :state
+
+    @sm\goto 'sending_declare_train_state_response',
+      :idemp_tok
+      recipient_id: pc_id
+      :error_reason
+
+  on_sending_declare_train_state_response: F '() => <>', =>
+    {
+      :idemp_tok
+      :recipient_id
+      :error_reason
+    } = @sm.state
+    @uplink\send_to recipient_id, DeclareTrainStateResponse idemp_tok, error_reason
+    @sm\goto 'waiting'
 
   on_changing_epoch: F '() => <>', =>
-    error 'TODO'
+    { :new_epoch } = @sm.state
+    @resource_orchestrator.events\enqueue
+      type: 'new-epoch'
+      :new_epoch
+    @sm\goto 'waiting'
 
   on_applying_config: F '() => <>', =>
-    error 'TODO'
+    { :config } = @sm.state
+    @config = config
+    @sm\goto 'waiting'
 
-  save: F '() => <>', =>
-    encoded = @encode_snapshot @snapshot!
-    with assert io.open @@SAVE_FILE, 'w+'
-      assert \write encoded
-      assert \close!
-    return
-
-  snapshot: F '() => MarshalSnapshot', =>
-    ret =
-      version: 1
-      epoch: @epoch
-      promise_tracker_snapshot: @promise_tracker\snapshot!
-    ret
-
-  encode_snapshot: F '(MarshalSnapshot) => string', (snapshot) =>
-    is_list = F '(table) -> boolean', (tab) ->
-      num_kv_pairs = 0
-      max_key = 0
-      min_key = 0
-      for key, _ in pairs tab
-        if 'number' != type key
-          return false
-        num_kv_pairs += 1
-        if key < min_key
-          min_key = key
-        else if max_key < key
-          max_key = key
-      min_key == 1 and num_kv_pairs == max_key
-    local encode
-    encode = F '(table, some) -> <>', (fragments, value) ->
-      with fragments
-        switch type value
-          when 'function', 'thread'
-            error "internal error: cannot encode a #{type value} value"
-          when 'table'
-            if is_list value
-              [] = '['
-              first = true
-              for elem in *value
-                if not first
-                  [] = ','
-                first = false
-
-                encode fragments, elem
-              [] = ']'
-            else
-              [] = '{'
-              first = true
-              for k, v in pairs value
-                if not first
-                  [] = ','
-                first = false
-
-                encode fragments, k
-                [] = ':'
-                encode fragments, v
-              [] = '}'
-          when 'string'
-            [] = "\"#{value\gsub '"', '\\"'}\""
-          when 'number', 'boolean'
-            [] = tostring value
-          else
-            error "internal error: unexpected type: #{type value}"
-      return
-
-    fragments = {}
-    encode fragments, snapshot
-    table.concat fragments
-
-  load: F '() => <>', =>
-    local raw_snapshot
-    with? io.open @@SAVE_FILE, 'r'
-      raw_snapshot = assert \read '*a'
-      assert \close!
-    if not save_data?
-      return
-
-    @load_snapshot @decode_snapshot raw_snapshot
-
-  load_snapshot: F '(MarshalSnapshot) => <>', (snapshot) =>
-    with snapshot
-      assert .version == 1
-      @epoch = .epoch
-      @promise_tracker\load_snapshot .promise_tracker_snapshot
-    return
-
-  decode_snapshot: F '(string) => MarshalSnapshot', (raw) =>
-    textutils.unserialiseJSON raw
+  -- save: F '() => <>', =>
+  --   encoded = @encode_snapshot @snapshot!
+  --   with assert io.open @@SAVE_FILE, 'w+'
+  --     assert \write encoded
+  --     assert \close!
+  --   return
+  --
+  -- snapshot: F '() => MarshalSnapshot', =>
+  --   ret =
+  --     version: 1
+  --     epoch: @epoch
+  --     promise_tracker_snapshot: @promise_tracker\snapshot!
+  --   ret
+  --
+  -- encode_snapshot: F '(MarshalSnapshot) => string', (snapshot) =>
+  --   is_list = F '(table) -> boolean', (tab) ->
+  --     num_kv_pairs = 0
+  --     max_key = 0
+  --     min_key = 0
+  --     for key, _ in pairs tab
+  --       if 'number' != type key
+  --         return false
+  --       num_kv_pairs += 1
+  --       if key < min_key
+  --         min_key = key
+  --       else if max_key < key
+  --         max_key = key
+  --     min_key == 1 and num_kv_pairs == max_key
+  --   local encode
+  --   encode = F '(table, some) -> <>', (fragments, value) ->
+  --     with fragments
+  --       switch type value
+  --         when 'function', 'thread'
+  --           error "internal error: cannot encode a #{type value} value"
+  --         when 'table'
+  --           if is_list value
+  --             [] = '['
+  --             first = true
+  --             for elem in *value
+  --               if not first
+  --                 [] = ','
+  --               first = false
+  --
+  --               encode fragments, elem
+  --             [] = ']'
+  --           else
+  --             [] = '{'
+  --             first = true
+  --             for k, v in pairs value
+  --               if not first
+  --                 [] = ','
+  --               first = false
+  --
+  --               encode fragments, k
+  --               [] = ':'
+  --               encode fragments, v
+  --             [] = '}'
+  --         when 'string'
+  --           [] = "\"#{value\gsub '"', '\\"'}\""
+  --         when 'number', 'boolean'
+  --           [] = tostring value
+  --         else
+  --           error "internal error: unexpected type: #{type value}"
+  --     return
+  --
+  --   fragments = {}
+  --   encode fragments, snapshot
+  --   table.concat fragments
+  --
+  -- load: F '() => <>', =>
+  --   local raw_snapshot
+  --   with? io.open @@SAVE_FILE, 'r'
+  --     raw_snapshot = assert \read '*a'
+  --     assert \close!
+  --   if not save_data?
+  --     return
+  --
+  --   @load_snapshot @decode_snapshot raw_snapshot
+  --
+  -- load_snapshot: F '(MarshalSnapshot) => <>', (snapshot) =>
+  --   with snapshot
+  --     assert .version == 1
+  --     @epoch = .epoch
+  --     @promise_tracker\load_snapshot .promise_tracker_snapshot
+  --   return
+  --
+  -- decode_snapshot: F '(string) => MarshalSnapshot', (raw) =>
+  --   textutils.unserialiseJSON raw
 
   run: F '() => !', =>
     parallel.waitForAny table.unpack @tasks!
@@ -328,11 +483,8 @@ export class Marshal
     with {}
       if not running_tests!
         [] = @\run_steps
-      [] = @\handle_events
       [] = @\count_epochs
       [] = @\listen_to_network
-      for task in *@upgrade_listener\tasks!
-        [] = task
 
   run_steps: F '() => !', =>
     while true
@@ -354,8 +506,10 @@ export class Marshal
       else
         coroutine.yield!
 
-  send_new_epoch_event: F '(number) => <>', (epoch) =>
-    @events\enqueue type: 'new-epoch', :epoch
+  send_new_epoch_event: F '(number) => <>', (new_epoch) =>
+    @events\enqueue
+      type: 'new-epoch'
+      :new_epoch
     coroutine.yield!
     return
 
@@ -366,273 +520,230 @@ export class Marshal
   read_network: F '() => <>', =>
     log -> "reading network..."
     _, packet = @uplink\receive_from_any!
-    import 'spec' as :repr
-    log -> "read a #{packet.protocol}"
-    trace "read #{repr packet}"
-    switch packet.protocol
-      when 'FactoryHeartbeat', 'DeclareTrainState', 'MarshalIdentityRequest', 'FactoryPcRequest', 'GetConfigRequest', 'SetConfigRequest'
-        @events\enqueue type: 'network-packet', :packet
-        coroutine.yield!
-      else
-        log -> "ignoring #{packet.protocol} packet"
-    return
-
-  handle_events: F '() => !', =>
-    local events = Queue 'MarshalEvent'
-    while true
-      @events, events = events, @events
-
-      local event
-      dequeue_event = ->
-        event = events\dequeue!
-        event?
-      while dequeue_event!
-        @handle_event event
-
-      if @throttle
-        os.sleep 0.001 -- Avoid CPU-hogging.
-      else
-        coroutine.yield!
-
-  handle_event: F '({type: MarshalEventType}) => <>', (event) =>
-    with event
-      switch .type
-        when 'new-epoch'
-          @on_new_epoch .epoch
-        when 'network-packet'
-          @on_network_packet .packet
-        else
-          error "internal error: unrecognised event type '#{.type}'"
-    return
-
-  on_new_epoch: F '(number) => <>', (epoch) =>
-    log -> "starting epoch #{epoch}"
-    @epoch = epoch
-    @prune_factories!
-    @prune_trains!
-    return
-
-  prune_factories: F '() => <>', =>
-    LIFETIME_EPOCHS = 1
-    @factories = T '{string->Factory}', @prune_statuses @factories, LIFETIME_EPOCHS
-
-  prune_trains: F '() => <>', =>
-    LIFETIME_EPOCHS = 10
-    @trains = T '{string->TrainStatus}', @prune_statuses @trains, LIFETIME_EPOCHS
-
-  prune_statuses: F '({string->{last_seen_epoch: number}}, number) => {string->{}}', (statuses, lifetime_epochs) =>
-    death_horizon_epoch = @epoch - lifetime_epochs
-    with {}
-      for name, status in pairs statuses
-        if status.last_seen_epoch < death_horizon_epoch
-          continue -- Prune
-        [name] = status
-
-  on_network_packet: F '(Packet) => <>', (packet) =>
-    log -> "handling a #{packet.protocol}"
-    switch packet.protocol
-      when 'FactoryHeartbeat'
-        @on_factory_heartbeat packet
-      when 'DeclareTrainState'
-        @on_declare_train_state packet
-      when 'MarshalIdentityRequest'
-        @on_marshal_identity_request packet
-      when 'FactoryPcRequest'
-        @on_factory_pc_request packet
-      when 'GetConfigRequest'
-        @on_get_config_request packet
-      when 'SetConfigRequest'
-        @on_set_config_request packet
-      else
-        error "internal error: unexpected network packet protocol reached marshal core '#{packet.protocol}'"
-
-  on_factory_heartbeat: F '(FactoryHeartbeat) => <>', (heartbeat) =>
-    lost_trains = with {}
-      for station in *heartbeat.stations.known
-        for train in *station.present_trains
-          if @promise_tracker\train_is_lost train
-            [] = train
-    for lost_train in *lost_trains
-      log -> "train '#{lost_train}' was lost. It will be ignored until manually cleared for use"
-    factory = @update_system_state heartbeat
-    @manage_resources factory
-
-  update_system_state: F '(FactoryHeartbeat) => Factory', (heartbeat) =>
-    { :pc_id, :name, :stations, :stockpile } = heartbeat
-
-    factory_status = @factories[name]
-    seen_before = factory_status?
-    @factories[name] = T 'Factory', with factory_status ?? :name, :pc_id
-      if seen_before and pc_id != .pc_id
-        log -> "temporarily ignoring possible imposter for factory #{name}: last known PC was ##{.pc_id}, got #{pc_id}"
-        return
-
-      .last_seen_epoch = @epoch
-      .stations = stations
-      .present_trains = present_trains
-      .stockpile = stockpile
-
-    for station in *stations.known
-      for present_train in *station.present_trains
-        @declare_train_seen present_train, name, station.name
-    for station in *stations.unknown
-      for present_train in *station.present_trains
-        @declare_train_seen present_train, name, station.name
-
-    @factories[name]
-
-  declare_train_seen: F '(string, string, string) => <>', (train_name, factory_name, station_name) =>
-    @trains[train_name] = T 'TrainStatus', with @trains[train_name] ?? name: train_name
-      .last_seen_epoch = @epoch
-      .last_seen_at_factory = factory_name
-      .last_seen_at_station = station_name
-    @promise_tracker\declare_train_seen train_name, station_name
-
-  manage_resources: F '(Factory) => <>', (factory) =>
-    low_resources = @get_low_resources factory.stockpile
-    import 'spec' as :repr
-    log -> "!! low resources: #{repr low_resources}"
-    if not low_resources?
+    if not @firewall\permits packet
       return
+    @events\enqueue
+      type: 'network-packet'
+      :packet
 
-    for resource in *low_resources
-      @manage_low_resource resource, factory
+  -- handle_events: F '() => !', =>
+  --   local events = Queue!
+  --   while true
+  --     @events, events = events, @events
+  --
+  --     local event
+  --     dequeue_event = ->
+  --       event = events\dequeue!
+  --       event?
+  --     while dequeue_event!
+  --       @handle_event event
+  --
+  --     if @throttle
+  --       os.sleep 0.001 -- Avoid CPU-hogging.
+  --     else
+  --       coroutine.yield!
 
-  get_low_resources: F '(DetectedStockpile) => ?[string]', (stockpile) =>
-    low_resources = nil
-    for resource in *stockpile.known
-      with resource
-        if not .shortage_amount?
-          continue
-        if .stored >= .shortage_amount
-          continue
+  -- handle_event: F '({type: MarshalEventType}) => <>', (event) =>
+  --   with event
+  --     switch .type
+  --       when 'new-epoch'
+  --         @on_new_epoch .epoch
+  --       when 'network-packet'
+  --         @on_network_packet .packet
+  --       else
+  --         error "internal error: unrecognised event type '#{.type}'"
+  --   return
 
-        if not low_resources?
-          low_resources = {}
-        low_resources[] = .name
-    low_resources
+  -- on_network_packet: F '(Packet) => <>', (packet) =>
+  --   log -> "handling a #{packet.protocol}"
+  --   switch packet.protocol
+  --     -- when 'FactoryHeartbeat'
+  --     --   @on_factory_heartbeat packet
+  --     -- when 'DeclareTrainState'
+  --     --   @on_declare_train_state packet
+  --     -- when 'MarshalIdentityRequest'
+  --     --   @on_marshal_identity_request packet
+  --     -- when 'FactoryPcRequest'
+  --     --   @on_factory_pc_request packet
+  --     -- when 'GetConfigRequest'
+  --     --   @on_get_config_request packet
+  --     -- when 'SetConfigRequest'
+  --     --   @on_set_config_request packet
+  --     else
+  --       error "internal error: unexpected network packet protocol reached marshal core '#{packet.protocol}'"
 
-  manage_low_resource: F '(string, Factory) => <>', (resource, factory) =>
-    MAX_ATTEMPTS = 25
+  -- on_factory_heartbeat: F '(FactoryHeartbeat) => <>', (heartbeat) =>
+    -- lost_trains = with {}
+    --   for station in *heartbeat.stations.known
+    --     for train in *station.present_trains
+    --       if @promise_tracker\train_is_lost train
+    --         [] = train
+    -- for lost_train in *lost_trains
+    --   log -> "train '#{lost_train}' was lost. It will be ignored until manually cleared for use"
+    -- factory = @update_system_state heartbeat
+    -- @manage_resources factory
+  --
+  -- update_system_state: F '(FactoryHeartbeat) => Factory', (heartbeat) =>
+  --   { :pc_id, :name, :stations, :stockpile } = heartbeat
+  --
+  --   factory_status = @factories[name]
+  --   seen_before = factory_status?
+  --   @factories[name] = T 'Factory', with factory_status ?? :name, :pc_id
+  --     if seen_before and pc_id != .pc_id
+  --       log -> "temporarily ignoring possible imposter for factory #{name}: last known PC was ##{.pc_id}, got #{pc_id}"
+  --       return
+  --
+  --     .last_seen_epoch = @epoch
+  --     .stations = stations
+  --     .present_trains = present_trains
+  --     .stockpile = stockpile
+  --
+  --   for station in *stations.known
+  --     for present_train in *station.present_trains
+  --       @declare_train_seen present_train, name, station.name
+  --   for station in *stations.unknown
+  --     for present_train in *station.present_trains
+  --       @declare_train_seen present_train, name, station.name
+  --
+  --   @factories[name]
+  --
+  -- declare_train_seen: F '(string, string, string) => <>', (train_name, factory_name, station_name) =>
+  --   @trains[train_name] = T 'TrainStatus', with @trains[train_name] ?? name: train_name
+  --     .last_seen_epoch = @epoch
+  --     .last_seen_at_factory = factory_name
+  --     .last_seen_at_station = station_name
+  --   @promise_tracker\declare_train_seen train_name, station_name
+  --
+  -- manage_resources: F '(Factory) => <>', (factory) =>
+  --   low_resources = @get_low_resources factory.stockpile
+  --   import 'spec' as :repr
+  --   log -> "!! low resources: #{repr low_resources}"
+  --   if not low_resources?
+  --     return
+  --
+  --   for resource in *low_resources
+  --     @manage_low_resource resource, factory
+  --
+  -- get_low_resources: F '(DetectedStockpile) => ?[string]', (stockpile) =>
+  --   low_resources = nil
+  --   for resource in *stockpile.known
+  --     with resource
+  --       if not .shortage_amount?
+  --         continue
+  --       if .stored >= .shortage_amount
+  --         continue
+  --
+  --       if not low_resources?
+  --         low_resources = {}
+  --       low_resources[] = .name
+  --   low_resources
+  --
+  -- manage_low_resource: F '(string, Factory) => <>', (resource, factory) =>
+  --   MAX_ATTEMPTS = 25
+  --
+  --   factory_list = [ factory for _, factory in pairs @factories ]
+  --   table.sort factory_list, (a, b) -> a.name < b.name
+  --   candidates_co = @scheduler\schedule_candidates resource, factory, factory_list
+  --   for _ = 1, MAX_ATTEMPTS
+  --     candidate = do
+  --       ok, yielded = coroutine.resume candidates_co
+  --       if not ok
+  --         error yielded
+  --       if not yielded?
+  --         break
+  --       yielded
+  --     @save!
+  --
+  --     {
+  --       train_addr: {
+  --         factory: {
+  --           name: factory_name,
+  --           pc_id: factory_pc_id,
+  --         },
+  --         station: {
+  --           name: station_name,
+  --         },
+  --         name: train_name,
+  --       },
+  --       :schedule,
+  --     } = candidate
+  --     with candidate
+  --       log -> "got candidate: #{train_name} from #{.outbound_station_addr.factory.name}(#{.outbound_station_addr.station.name}) to #{.inbound_station_addr.factory.name}(#{.inbound_station_addr.station.name})"
+  --
+  --     idemp_tok = IdempotenceToken!
+  --     @uplink\send_to factory_pc_id, ScheduleRequest idemp_tok, station_name, train_name, schedule
+  --
+  --     _, response = @uplink\receive_from factory_pc_id, ScheduleResponse, timeout: 1
+  --     if response == TIMEOUT
+  --       log -> 'discarding candidate due to timeout'
+  --       continue
+  --     if response.idemp_tok != idemp_tok
+  --       continue
+  --     if error_reason = response.error_reason
+  --       log -> "cannot schedule train at #{factory_name}:#{station_name}: #{error_reason}"
+  --     log -> "schedule applied"
+  --     return
+  --
+  --   trace "no trains available to take #{resource} to #{factory.name}, will re-attempt next heartbeat"
+  --   return
 
-    factory_list = [ factory for _, factory in pairs @factories ]
-    table.sort factory_list, (a, b) -> a.name < b.name
-    candidates_co = @scheduler\schedule_candidates resource, factory, factory_list
-    for _ = 1, MAX_ATTEMPTS
-      candidate = do
-        ok, yielded = coroutine.resume candidates_co
-        if not ok
-          error yielded
-        if not yielded?
-          break
-        yielded
-      @save!
+  -- on_marshal_identity_request: F '(MarshalIdentityRequest) => <>', (packet) =>
+  --   { :idemp_tok, :pc_id, :name } = packet
+  --   if not name?
+  --     @uplink\send_to pc_id, MarshalIdentityResponse idemp_tok, @pc\id!
+  --     return
+  --
+  --   @uplink\send_to pc_id,
+  --     MarshalIdentityResponse idemp_tok,
+  --       @factories[name]?.pc_id or "no known factory '#{name}'"
 
-      {
-        train_addr: {
-          factory: {
-            name: factory_name,
-            pc_id: factory_pc_id,
-          },
-          station: {
-            name: station_name,
-          },
-          name: train_name,
-        },
-        :schedule,
-      } = candidate
-      with candidate
-        log -> "got candidate: #{train_name} from #{.outbound_station_addr.factory.name}(#{.outbound_station_addr.station.name}) to #{.inbound_station_addr.factory.name}(#{.inbound_station_addr.station.name})"
+  -- on_factory_pc_request: F '(FactoryPcRequest) => <>', (packet) =>
+  --   { :idemp_tok, :pc_id, :name } = packet
+  --   factory = @factories[name]
+  --   if not factory?
+  --     @uplink\send_to pc_id, FactoryPcResponse idemp_tok, "no known factory '#{name}'"
+  --     return
+  --
+  --   @uplink\send_to pc_id, FactoryPcResponse idemp_tok, factory.pc_id
 
-      idemp_tok = IdempotenceToken!
-      @uplink\send_to factory_pc_id, ScheduleRequest idemp_tok, station_name, train_name, schedule
+  -- on_get_config_request: F '(GetConfigRequest) => <>', (packet) =>
+  --   { :idemp_tok, :pc_id } = packet
+  --   @uplink\send_to pc_id, GetConfigResponse idemp_tok, @config.<raw>
 
-      _, response = @uplink\receive_from factory_pc_id, ScheduleResponse, timeout: 1
-      if response == TIMEOUT
-        log -> 'discarding candidate due to timeout'
-        continue
-      if response.idemp_tok != idemp_tok
-        continue
-      if error_reason = response.error_reason
-        log -> "cannot schedule train at #{factory_name}:#{station_name}: #{error_reason}"
-      log -> "schedule applied"
-      return
-
-    trace "no trains available to take #{resource} to #{factory.name}, will re-attempt next heartbeat"
-    return
-
-  on_declare_train_state: F '(DeclareTrainState) => <>', (packet) =>
-    { :idemp_tok, :pc_id, :name, :state } = packet
-    err = switch state
-      when 'cleared' -- TODO(kcza): this name is a leak from the CLI
-        @promise_tracker\declare_train_found name
-      when 'reserved'
-        @promise_tracker\reserve name
-        nil
-      else
-        "internal error: unknown train state '#{state}'"
-    @uplink\send_to pc_id, DeclareTrainStateResponse idemp_tok, err
-
-  on_marshal_identity_request: F '(MarshalIdentityRequest) => <>', (packet) =>
-    { :idemp_tok, :pc_id, :name } = packet
-    if not name?
-      @uplink\send_to pc_id, MarshalIdentityResponse idemp_tok, @pc\id!
-      return
-
-    @uplink\send_to pc_id,
-      MarshalIdentityResponse idemp_tok,
-        @factories[name]?.pc_id or "no known factory '#{name}'"
-
-  on_factory_pc_request: F '(FactoryPcRequest) => <>', (packet) =>
-    { :idemp_tok, :pc_id, :name } = packet
-    factory = @factories[name]
-    if not factory?
-      @uplink\send_to pc_id, FactoryPcResponse idemp_tok, "no known factory '#{name}'"
-      return
-
-    @uplink\send_to pc_id, FactoryPcResponse idemp_tok, factory.pc_id
-
-  on_get_config_request: F '(GetConfigRequest) => <>', (packet) =>
-    { :idemp_tok, :pc_id } = packet
-    @uplink\send_to pc_id, GetConfigResponse idemp_tok, @config.<raw>
-
-  on_set_config_request: F '(SetConfigRequest) => <>', (packet) =>
-    { :idemp_tok, :pc_id, :raw } = packet
-    config, err = toml.decode raw
-    if err?
-      @uplink\send_to pc_id, SetConfigResponse idemp_tok, err
-      return
-
-    ok, err = is 'MarshalConfig', config
-    if not ok
-      @uplink\send_to pc_id, SetConfigResponse idemp_tok, err
-      return
-
-    config.<> = {}
-    config.<raw> = raw
-    @set_config config
-    @uplink\send_to pc_id, SetConfigResponse idemp_tok, nil
-
-  set_config: F '(MarshalConfig+StoredConfig) => <>', (@config) =>
+  -- on_set_config_request: F '(SetConfigRequest) => <>', (packet) =>
+  --   { :idemp_tok, :pc_id, :raw } = packet
+  --   config, err = toml.decode raw
+  --   if err?
+  --     @uplink\send_to pc_id, SetConfigResponse idemp_tok, err
+  --     return
+  --
+  --   ok, err = is 'MarshalConfig', config
+  --   if not ok
+  --     @uplink\send_to pc_id, SetConfigResponse idemp_tok, err
+  --     return
+  --
+  --   config.<> = {}
+  --   config.<raw> = raw
+  --   @set_config config
+  --   @uplink\send_to pc_id, SetConfigResponse idemp_tok, nil
 
   ut_stop_counting_epochs: F '() => <>', =>
     @do_count_epochs = false
 
   ut_step: F '() => <>', =>
+    @ut_step_num ??= 0
+    @ut_step_num += 1
+    print "--- ut_step (#{@ut_step_num}) ---"
+
     @ut_tasks ??= with RoundRobin!
       for task in *@tasks!
         \add task
-
     @ut_tasks\run_pass!
 
-    local event
-    dequeue_event = ->
-      event = @events\dequeue!
-      event?
-    while dequeue_event!
-      @handle_event event
+    @step!
 
-  ut_epoch: F '() => number', => @epoch
+  ut_epoch: F '() => number', =>
+    @resource_orchestrator.epoch
 
   ut_set_epoch: F '(number) => <>', (epoch) =>
     @epoch = epoch
@@ -640,18 +751,18 @@ export class Marshal
       @send_new_epoch_event epoch
     return
 
-  ut_factories: F '() => {string->Factory}', => @factories
+  ut_factories: F '() => {string->Factory}', => @resource_orchestrator.factories
 
-  ut_trains: F '() => {string->TrainStatus}', => @trains
+  ut_trains: F '() => {string->TrainStatus}', => @resource_orchestrator.trains
 
   ut_declare_train_lost: F '(string) => <>', (train_name) =>
-    @promise_tracker\ut_declare_train_lost train_name
+    @scheduler.promise_tracker\ut_declare_train_lost train_name
 
   ut_train_is_lost: F '(string) => boolean', (train_name) =>
-    @promise_tracker\train_is_lost train_name
+    @scheduler.promise_tracker\train_is_lost train_name
 
   ut_train_is_reserved: F '(string) => boolean', (train_name) =>
-    @promise_tracker\train_is_promised train_name
+    @scheduler.promise_tracker\train_is_promised train_name
 
   ut_config: F '() => MarshalConfig', => @config
 
@@ -689,7 +800,6 @@ spec ->
   import 'spec_macros' as $
 
   import 'ox.clock' as :TestClock
-  import 'ox.cmd.declare' as :DeclareTrainState
   import 'ox.configurator.main' as :GetConfigRequest, :SetConfigRequest
   import 'ox.pc' as :TestPcBackend
   import 'spec' as :describe, :it, :matchers
@@ -762,103 +872,104 @@ spec ->
         pc = Pc!
         with Marshal :config, :pc, :uplink, clock: TestClock!
           \ut_stop_counting_epochs!
-          for i = 1, EXPECTED_FACTORIES
+          for i = 1, 13
             \ut_step!
 
           epoch = \ut_epoch!
-          $assert_that \ut_factories!, has_fields
-            factory_1: has_fields
-              name: eq 'factory_1'
-              pc_id: eq 1
-              last_seen_epoch: eq epoch
-              stations: has_fields
-                known: has_fields
-                  * has_fields name: eq 'station_3'
-                  * has_fields name: eq 'station_4'
-                unknown: len eq 0
-              stockpile: deep_eq stockpile
-            factory_2: has_fields
-              name: eq 'factory_2'
-              pc_id: eq 2
-              last_seen_epoch: eq epoch
-              stations: has_fields
-                known: has_fields
-                  * has_fields name: eq "station_6"
-                  * has_fields name: eq "station_7"
-                unknown: len eq 0
-              stockpile: deep_eq stockpile
-            factory_3: has_fields
-              name: eq 'factory_3'
-              pc_id: eq 3
-              last_seen_epoch: eq epoch
-              stations: has_fields
-                known: has_fields
-                  * has_fields name: eq "station_9"
-                  * has_fields name: eq "station_10"
-                unknown: len eq 0
-              stockpile: deep_eq stockpile
-            factory_4: has_fields
-              name: eq 'factory_4'
-              pc_id: eq 4
-              last_seen_epoch: eq epoch
-              stations: has_fields {}
-                known: has_fields
-                  * has_fields name: eq "station_12"
-                  * has_fields name: eq "station_13"
-                unknown: len eq 0
-              stockpile: deep_eq stockpile
+          factories = \ut_factories!
+          $assert_that factories.factory_1, has_fields
+            name: eq 'factory_1'
+            pc_id: eq 1
+            last_seen_epoch: eq epoch
+            stations: has_fields
+              known: has_fields
+                * has_fields name: eq 'station_3'
+                * has_fields name: eq 'station_4'
+              unknown: len eq 0
+            stockpile: deep_eq stockpile
+          $assert_that factories.factory_2, has_fields
+            name: eq 'factory_2'
+            pc_id: eq 2
+            last_seen_epoch: eq epoch
+            stations: has_fields
+              known: has_fields
+                * has_fields name: eq "station_6"
+                * has_fields name: eq "station_7"
+              unknown: len eq 0
+            stockpile: deep_eq stockpile
+          $assert_that factories.factory_3, has_fields
+            name: eq 'factory_3'
+            pc_id: eq 3
+            last_seen_epoch: eq epoch
+            stations: has_fields
+              known: has_fields
+                * has_fields name: eq "station_9"
+                * has_fields name: eq "station_10"
+              unknown: len eq 0
+            stockpile: deep_eq stockpile
+          $assert_that factories.factory_4, has_fields
+            name: eq 'factory_4'
+            pc_id: eq 4
+            last_seen_epoch: eq epoch
+            stations: has_fields {}
+              known: has_fields
+                * has_fields name: eq "station_12"
+                * has_fields name: eq "station_13"
+              unknown: len eq 0
+            stockpile: deep_eq stockpile
 
           test_phase = 'change-factory-stations'
           uplink.backend\reset!
-          for i = 1, EXPECTED_FACTORIES
+          for _ = 1, 13
             \ut_step!
 
-          $assert_that \ut_factories!, has_fields
-            factory_1: has_fields
-              name: eq 'factory_1'
-              pc_id: eq 1
-              last_seen_epoch: eq epoch
-              stations: has_fields
-                known: has_fields
-                  * has_fields name: eq "station_3"
-                  * has_fields name: eq "station_5"
-                unknown: len eq 0
-              stockpile: deep_eq stockpile
-            factory_2: has_fields
-              name: eq 'factory_2'
-              pc_id: eq 2
-              last_seen_epoch: eq epoch
-              stations: has_fields
-                known: has_fields
-                  * has_fields name: eq "station_6"
-                  * has_fields name: eq "station_8"
-                unknown: len eq 0
-              stockpile: deep_eq stockpile
-            factory_3: has_fields
-              name: eq 'factory_3'
-              pc_id: eq 3
-              last_seen_epoch: eq epoch
-              stations: has_fields
-                known: has_fields
-                  * has_fields name: eq "station_9"
-                  * has_fields name: eq "station_11"
-                unknown: len eq 0
-              stockpile: deep_eq stockpile
-            factory_4: has_fields
-              name: eq 'factory_4'
-              pc_id: eq 4
-              last_seen_epoch: eq epoch
-              stations: has_fields
-                known: has_fields
-                  * has_fields name: eq "station_12"
-                  * has_fields name: eq "station_14"
-                unknown: len eq 0
-              stockpile: deep_eq stockpile
+          factories = \ut_factories!
+          $assert_that factories.factory_1, has_fields
+            name: eq 'factory_1'
+            pc_id: eq 1
+            last_seen_epoch: eq epoch
+            stations: has_fields
+              known: has_fields
+                * has_fields name: eq "station_3"
+                * has_fields name: eq "station_5"
+              unknown: len eq 0
+            stockpile: deep_eq stockpile
+          $assert_that factories.factory_2, has_fields
+            name: eq 'factory_2'
+            pc_id: eq 2
+            last_seen_epoch: eq epoch
+            stations: has_fields
+              known: has_fields
+                * has_fields name: eq "station_6"
+                * has_fields name: eq "station_8"
+              unknown: len eq 0
+            stockpile: deep_eq stockpile
+          $assert_that factories.factory_3, has_fields
+            name: eq 'factory_3'
+            pc_id: eq 3
+            last_seen_epoch: eq epoch
+            stations: has_fields
+              known: has_fields
+                * has_fields name: eq "station_9"
+                * has_fields name: eq "station_11"
+              unknown: len eq 0
+            stockpile: deep_eq stockpile
+          $assert_that factories.factory_4, has_fields
+            name: eq 'factory_4'
+            pc_id: eq 4
+            last_seen_epoch: eq epoch
+            stations: has_fields
+              known: has_fields
+                * has_fields name: eq "station_12"
+                * has_fields name: eq "station_14"
+              unknown: len eq 0
+            stockpile: deep_eq stockpile
 
           test_phase = 'global-disconnect'
           uplink.backend\reset!
           \ut_set_epoch 10
-          \ut_step!
+          for _ = 1, 3
+            \ut_step!
 
           $expect_that \ut_factories!, deep_eq {}
 
@@ -892,7 +1003,8 @@ spec ->
           \ut_declare_train_lost TRAIN_NAME
           $assert_that (\ut_train_is_lost TRAIN_NAME), eq true
 
-          \ut_step!
+          for _ = 1, 6
+            \ut_step!
           $assert_that (\ut_train_is_lost TRAIN_NAME), eq false
           $assert_that uplink.backend.sent, len eq 1
           $expect_that uplink.backend.sent[1], has_fields
@@ -902,7 +1014,8 @@ spec ->
               error_reason: eq nil
             protocol: eq DeclareTrainStateResponse::protocol!
 
-          \ut_step!
+          for _ = 1, 4
+            \ut_step!
           $assert_that (\ut_train_is_lost TRAIN_NAME), eq false
           $assert_that uplink.backend.sent, len eq 2
           $expect_that uplink.backend.sent[2], has_fields
@@ -934,7 +1047,8 @@ spec ->
           \ut_stop_counting_epochs!
           $assert_that (\ut_train_is_reserved TRAIN_NAME), eq false
 
-          \ut_step!
+          for _ = 1, 5
+            \ut_step!
           $assert_that (\ut_train_is_reserved TRAIN_NAME), eq true
           $assert_that uplink.backend.sent, len eq 1
           $expect_that uplink.backend.sent[1], has_fields
@@ -944,8 +1058,9 @@ spec ->
               error_reason: eq nil
             protocol: eq DeclareTrainStateResponse::protocol!
 
-          \ut_step!
           -- Check re-declarations are ignored
+          for _ = 1, 5
+            \ut_step!
           $assert_that uplink.backend.sent, len eq 2
           $expect_that uplink.backend.sent[2], has_fields
             id: eq PC_ID
@@ -973,7 +1088,8 @@ spec ->
           id: => MARSHAL_PC_ID
         with Marshal :config, :pc, :uplink, clock: TestClock!
           \ut_stop_counting_epochs!
-          \ut_step!
+          for _ = 1, 4
+            \ut_step!
 
         $expect_that uplink.backend.sent, len eq 1
         $expect_that uplink.backend.sent[1], has_fields
@@ -1016,9 +1132,8 @@ spec ->
           id: -> MARSHAL_PC_ID
         with Marshal :config, :pc, :uplink, clock: TestClock!
           \ut_stop_counting_epochs!
-          \ut_step!
-          \ut_step!
-          \ut_step!
+          for _ = 1, 10
+            \ut_step!
 
         $expect_that uplink.backend.sent, len eq 2
         $expect_that uplink.backend.sent[1], has_fields
@@ -1054,7 +1169,8 @@ spec ->
           id: -> MARSHAL_PC_ID
         with Marshal :config, :pc, :uplink, clock: TestClock!
           \ut_stop_counting_epochs!
-          \ut_step!
+          for _ = 1, 5
+            \ut_step!
 
         $expect_that uplink.backend.sent, len eq 1
         $expect_that uplink.backend.sent[1], has_fields
@@ -1087,7 +1203,8 @@ spec ->
           id: -> MARSHAL_PC_ID
         with Marshal :config, :pc, :uplink, clock: TestClock!
           \ut_stop_counting_epochs!
-          \ut_step!
+          for _ = 1, 8
+            \ut_step!
 
           $expect_that uplink.backend.sent, len eq 1
           $expect_that uplink.backend.sent[1], has_fields
@@ -1122,7 +1239,8 @@ spec ->
           id: -> MARSHAL_PC_ID
         with Marshal :config, :pc, :uplink, clock: TestClock!
           \ut_stop_counting_epochs!
-          \ut_step!
+          for _ = 1, 5
+            \ut_step!
 
           $expect_that uplink.backend.sent, len eq 1
           $expect_that uplink.backend.sent[1], has_fields

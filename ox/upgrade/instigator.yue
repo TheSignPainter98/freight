@@ -5,18 +5,38 @@ import 'ox.logger' as :fatal, :log
 import 'ox.peripheral.uplink' as :IdempotenceToken, :Packet, :TIMEOUT, :Uplink
 import 'ox.upgrade.rebooter' as :MinecraftRebooter, :RebootRequest
 import 'ox.upgrade.tester' as :Tester
-import 'quicktype' as :F
+import 'quicktype' as :declare_type, :F
 import 'spec' as :spec
 
+declare_type 'InstigatorOpts', [[{
+  config: ?{},
+  pc: Pc,
+  rebooter: ?Rebooter,
+  release: Release,
+  uplink: ?Uplink,
+}]]
 export class Instigator using Tester
-  new: F '(?{}, Release, ?Uplink, ?Rebooter) => <>', (@config, @release, @uplink=Uplink!, @rebooter=MinecraftRebooter!) =>
+  new: F '(InstigatorOpts) => <>', (opts) =>
+    {
+      :config
+      :pc
+      :release
+      :uplink=Uplink!
+      :rebooter=MinecraftRebooter!
+    } = opts
+    @config = config
+    @pc = pc
+    @release = release
+    @uplink = uplink
+    @rebooter = rebooter
+
     if config?.marshal?
       fatal 'cannot instigate upgrade from marshal'
 
-  upgrade: F '(?boolean) => <>', (prompt=true) =>
+  upgrade: F '(?"no-prompt") => <>', (prompt) =>
     assert @test @release
 
-    if prompt
+    if prompt != 'no-prompt'
       local resp
       while resp != ''
         print "ready to upgrade to version #{@release.version}"
@@ -29,14 +49,16 @@ export class Instigator using Tester
 
   bump_marshal: F '(Release) => <>', (release) =>
     log -> 'bumping marshal...'
-    @uplink\broadcast MarshalBumpRelease release
+    @uplink\broadcast MarshalBumpRelease release, @pc\id!
     return
 
   await_reboot_request: F '() => boolean', =>
     log -> 'awaiting reboot request...'
     MAX_ATTEMPTS = 3
     for i = 1, MAX_ATTEMPTS
-      print "awaiting reboot request (attempt #{i}/#{MAX_ATTEMPTS})"
+      if i > 1
+        print "awaiting reboot request (attempt #{i}/#{MAX_ATTEMPTS})"
+
       ok, err = @uplink\receive_from_any RebootRequest, timeout: 5
       if ok
         return true
@@ -49,16 +71,17 @@ export class Instigator using Tester
     @rebooter\reboot!
 
 export class MarshalBumpRelease extends Packet
-  new: F '(Release) => <>', (@release) =>
+  new: F '(Release, number) => <>', (@release, @pc_id) =>
     super!
 
 spec ->
   import 'spec_macros' as $
 
+  import 'ox.pc' as :Pc, :TestPcBackend
   import 'ox.peripheral.uplink' as :TestUplinkBackend
   import 'spec' as :describe, :it, :matchers
 
-  import deep_eq, errors, matches from matchers
+  import deep_eq, eq, errors, has_fields, len, matches from matchers
 
   class TestRebooter
     @marker: 'REBOOTING'
@@ -68,11 +91,12 @@ spec ->
 
   describe 'Instigator', ->
     it 'instigates valid updates', ->
-      cfg = {}
+      config = {}
       release =
         file: 'ox'
         version: '9999999999999999'
         content: ''
+      PC_ID = 12345
 
       last_idemp_tok = nil
       uplink = Uplink TestUplinkBackend
@@ -83,12 +107,22 @@ spec ->
           last_idemp_tok = packet.idemp_tok
           true
 
+      pc = Pc TestPcBackend
+        id: => PC_ID
       rebooter = TestRebooter!
-      upgrader = with Instigator cfg, release, uplink, rebooter
-        $expect_that (-> \upgrade false), errors matches TestRebooter.marker
-      $expect_that uplink.backend.sent, deep_eq {}
-      $expect_that uplink.backend.broadcasted, deep_eq
-        * protocol: 'MarshalBumpRelease'
-          packet:
-            protocol: 'MarshalBumpRelease'
-            :release
+      upgrader = Instigator
+        :config
+        :pc
+        :rebooter
+        :release
+        :uplink
+      $expect_that (-> upgrader\upgrade 'no-prompt'), errors matches TestRebooter.marker
+
+      $expect_that uplink.backend.sent, len eq 0
+      $expect_that uplink.backend.broadcasted, len eq 1
+      $expect_that uplink.backend.broadcasted[1], has_fields
+        protocol: eq 'MarshalBumpRelease'
+        packet: has_fields
+          protocol: eq 'MarshalBumpRelease'
+          pc_id: eq PC_ID
+          release: deep_eq release

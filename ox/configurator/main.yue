@@ -2,8 +2,6 @@ local *
 
 local MarshalIdentityRequest
 local MarshalIdentityResponse
-local FactoryPcRequest
-local FactoryPcResponse
 local GetConfigRequest
 local GetConfigResponse
 local SetConfigRequest

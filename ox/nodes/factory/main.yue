@@ -318,10 +318,24 @@ class Factory
           continue
         .known[] = { ...config, stored: 0 }
 
+declare_type 'ScheduleRequest', [[
+  Packet + {
+    idemp_tok: IdempotenceToken,
+    station_name: string,
+    train_name: string,
+    schedule: Schedule,
+  }
+]]
 export class ScheduleRequest extends Packet
   new: F '(IdempotenceToken, string, string, Schedule) => <>', (@idemp_tok, @station_name, @train_name, @schedule) =>
     super!
 
+declare_type 'ScheduleResponse', [[
+  Packet + {
+    idemp_tok: IdempotenceToken,
+    error_reason: ?string,
+  }
+]]
 export class ScheduleResponse extends Packet
   new: F '(IdempotenceToken, ?string) => <>', (@idemp_tok, @error_reason) =>
     super!

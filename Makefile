@@ -1,6 +1,6 @@
 LUA = luajit
 
-DIAGRAM_NAMES = marshal-main marshal-resource_orchestrator marshal-schedule_generator marshal-scheduler upgrade_listener config_listener
+DIAGRAM_NAMES = marshal-main marshal-resource_orchestrator marshal-scheduler marshal-schedule_generator marshal-schedule_generator_impl upgrade_listener config_listener
 DIAGRAMS = $(patsubst %,docs/src/reference-materials/state-machine-diagrams/%.mmd,$(DIAGRAM_NAMES))
 DOC_HELPERS = docs/mdbook-ox/target/release/mdbook-ox
 RUST_SOURCES = $(shell find docs/mdbook-ox/src/ -name '*.rs')
